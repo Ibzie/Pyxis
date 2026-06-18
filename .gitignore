@@ -1,5 +1,10 @@
+.venv
+__pycache__/
+*.pyc
 /target
 **/*.rs.bk
 *.pdb
 .DS_Store
 Thumbs.db
+captures/
+test.pdf

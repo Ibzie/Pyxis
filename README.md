@@ -1,12 +1,12 @@
 # AI-PDF
 
-A fast, native PDF reader with a graphical interface, built in Rust.
+A fast, native PDF reader with a graphical interface, built in Python.
 
 ## Features
 
-- **GPU-accelerated rendering** via PDFium and wgpu
+- **Native PDF rendering** via PyMuPDF (MuPDF)
 - **Page-by-page scrolling** with virtual rendering and LRU cache
-- **Full-text search** across all pages using regex
+- **Full-text search** across all pages
 - **Bookmark / table of contents** navigation in sidebar
 - **Zoom controls** with predefined levels (25%–400%) and fit-to-width mode
 - **Keyboard shortcuts** for all common actions
@@ -15,24 +15,24 @@ A fast, native PDF reader with a graphical interface, built in Rust.
 
 ## Installation
 
-Requires the [Rust toolchain](https://rustup.rs).
+Requires Python 3.10+.
 
 ```bash
 git clone https://github.com/anomalyco/ai-pdf.git
 cd ai-pdf
-cargo build --release
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
-
-On first run, the PDFium native library is downloaded automatically.
 
 ## Usage
 
 ```bash
 # Open the welcome screen
-cargo run --release
+python main.py
 
 # Open a PDF directly
-cargo run --release -- document.pdf
+python main.py document.pdf
 ```
 
 ### Keyboard Shortcuts
@@ -45,11 +45,11 @@ cargo run --release -- document.pdf
 | `Ctrl+-` | Zoom out |
 | `Alt+Right` | Next page |
 | `Alt+Left` | Previous page |
-| `Esc` | Clear search |
+| `Esc` | Clear search / cancel capture |
 
 ## Tech Stack
 
-Rust, [Iced](https://iced.rs/), [PDFium](https://pdfium.googlesource.com/pdfium/), [lopdf](https://crates.io/crates/lopdf)
+Python, [PyQt6](https://riverbankcomputing.com/software/pyqt/), [PyMuPDF](https://pymupdf.readthedocs.io/)
 
 ## License
 
