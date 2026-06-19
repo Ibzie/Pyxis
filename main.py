@@ -7,16 +7,19 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QMenu, QListWidget, QListWidgetItem,
-    QStatusBar
+    QStatusBar, QSplitter
 )
 from pdf_engine import PdfEngine, ZOOM_LEVELS
 from page_view import PageView
+from notes_panel import NotesPanel
+from storage import PdfStorage
 
 
 class MainWindow(QMainWindow):
     def __init__(self, cli_path=None):
         super().__init__()
         self.engine = PdfEngine()
+        self.storage = None
         self.pages = []
         self.zoom_index = 5
         self.zoom_level = 1.0
@@ -24,13 +27,13 @@ class MainWindow(QMainWindow):
         self.current_page = 0
         self.search_results = []
         self.search_index = 0
-        self.highlights = []
         self.capture_mode = False
         self.setWindowTitle("AI-PDF Reader")
-        self.resize(1400, 900)
+        self.resize(1600, 900)
         self.setStyleSheet("background-color: #121212; color: #eeeeee;")
         self._build_toolbar()
         self._build_sidebar()
+        self._build_notes_panel()
         self._build_viewer()
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -71,10 +74,11 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(QPushButton("✕", clicked=self.clear_search))
         self.toolbar.addSeparator()
         self.toolbar.addWidget(QPushButton("☰", clicked=self.toggle_sidebar))
+        self.toolbar.addWidget(QPushButton("📝", clicked=self.toggle_notes))
 
     def _build_sidebar(self):
         self.sidebar = QFrame()
-        self.sidebar.setFixedWidth(280)
+        self.sidebar.setFixedWidth(260)
         self.sidebar.setStyleSheet("background-color: #1a1a1a;")
         layout = QVBoxLayout(self.sidebar)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -89,13 +93,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.info_label)
         layout.addStretch()
 
+    def _build_notes_panel(self):
+        self.notes_panel = NotesPanel()
+        self.notes_panel.on_save(self._save_notes)
+        self.notes_panel.setMaximumWidth(420)
+        self.notes_panel.setMinimumWidth(260)
+
     def _build_viewer(self):
         central = QWidget()
         self.setCentralWidget(central)
         hbox = QHBoxLayout(central)
         hbox.setContentsMargins(0, 0, 0, 0)
         hbox.setSpacing(0)
-        hbox.addWidget(self.sidebar)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self.sidebar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet("background-color: #121212; border: none;")
@@ -106,7 +117,14 @@ class MainWindow(QMainWindow):
         self.pages_layout.setContentsMargins(20, 20, 20, 20)
         self.pages_layout.addStretch()
         self.scroll.setWidget(self.pages_widget)
-        hbox.addWidget(self.scroll)
+        self.splitter.addWidget(self.scroll)
+        self.splitter.addWidget(self.notes_panel)
+        self.splitter.setSizes([260, 960, 340])
+        hbox.addWidget(self.splitter)
+
+    def _save_notes(self, text):
+        if self.storage:
+            self.storage.save_notes(text)
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
@@ -119,7 +137,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{e}")
             return
-        self.highlights = []
+        self.storage = PdfStorage(path)
         self.current_page = 0
         self.zoom_index = 5
         self.zoom_level = 1.0
@@ -128,9 +146,11 @@ class MainWindow(QMainWindow):
         self.search_index = 0
         self.search_box.clear()
         self.search_info.setText("")
+        self.notes_panel.set_text(self.storage.load_notes())
         self._populate_bookmarks()
         self._update_info()
         self._rebuild_pages()
+        self._apply_persisted_highlights()
         self.status.showMessage(f"Loaded {Path(path).name} — {self.engine.page_count} pages")
 
     def _populate_bookmarks(self):
@@ -183,6 +203,13 @@ class MainWindow(QMainWindow):
             page.set_image(img)
         self.update_current_page()
 
+    def _apply_persisted_highlights(self):
+        if not self.storage:
+            return
+        for page in self.pages:
+            hls = [h["bbox"] for h in self.storage.get_highlights_for_page(page.page_idx)]
+            page.set_highlights(hls)
+
     def update_current_page(self):
         if not self.pages:
             return
@@ -227,6 +254,9 @@ class MainWindow(QMainWindow):
     def toggle_sidebar(self):
         self.sidebar.setVisible(not self.sidebar.isVisible())
 
+    def toggle_notes(self):
+        self.notes_panel.setVisible(not self.notes_panel.isVisible())
+
     def bookmark_clicked(self, item):
         self.go_to_page(item.data(Qt.ItemDataRole.UserRole))
 
@@ -264,11 +294,11 @@ class MainWindow(QMainWindow):
         hl_idx = page.highlight_at(screen_pos)
         if selected_text:
             menu.addAction("Copy", lambda: self.copy_selection(page))
-            menu.addAction("Highlight", lambda: self.save_highlight(page))
+            menu.addAction("Add to Notes", lambda: self.add_highlight_to_notes(page))
         if hl_idx is not None:
             menu.addAction("Remove Highlight", lambda: self.remove_highlight(page_idx, hl_idx))
         if not selected_text and hl_idx is None:
-            menu.addAction("Screen Capture", self.start_capture)
+            menu.addAction("Capture Screen", self.start_capture)
         menu.addSeparator()
         menu.addAction("Dismiss", menu.close)
         menu.exec(global_pos)
@@ -280,31 +310,36 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Copied to clipboard")
         page.clear_selection()
 
-    def save_highlight(self, page):
+    def add_highlight_to_notes(self, page):
+        text = page.get_selection_text()
         bbox = page.get_selection_bbox()
-        if bbox:
-            self.highlights.append({"page": page.page_idx, "bbox": bbox})
-            self._refresh_highlights()
-            self.status.showMessage("Highlight saved")
+        if not text or not bbox or not self.storage:
+            page.clear_selection()
+            return
+        img = self.engine.render_page(page.page_idx, page.width())
+        x, y, x1, y1 = bbox
+        sx, sy = int(x * page.zoom), int(y * page.zoom)
+        sw, sh = int((x1 - x) * page.zoom), int((y1 - y) * page.zoom)
+        cropped = img.copy(sx, sy, sw, sh)
+        filepath, entry = self.storage.save_highlight(page.page_idx, cropped, bbox, text)
+        page.highlights.append(bbox)
+        page.update()
+        rel = filepath.relative_to(self.storage.folder).as_posix()
+        self.notes_panel.append_markdown(
+            f"## Highlight — Page {page.page_idx + 1}\n\n"
+            f"> {text}\n\n"
+            f"![highlight]({rel})\n\n"
+            f"_Page {page.page_idx + 1}_"
+        )
+        self.status.showMessage("Highlight added to notes")
         page.clear_selection()
 
     def remove_highlight(self, page_idx, hl_idx):
-        count = 0
-        kept = []
-        for h in self.highlights:
-            if h["page"] == page_idx:
-                if count != hl_idx:
-                    kept.append(h)
-                count += 1
-            else:
-                kept.append(h)
-        self.highlights = kept
-        self._refresh_highlights()
-
-    def _refresh_highlights(self):
-        for page in self.pages:
-            hls = [h["bbox"] for h in self.highlights if h["page"] == page.page_idx]
-            page.set_highlights(hls)
+        if not self.storage:
+            return
+        self.storage.remove_highlight(page_idx, hl_idx)
+        self._apply_persisted_highlights()
+        self.status.showMessage("Highlight removed")
 
     def start_capture(self):
         self.capture_mode = True
@@ -321,34 +356,20 @@ class MainWindow(QMainWindow):
     def complete_capture(self, page_idx):
         page = self.pages[page_idx]
         rect = page.get_capture_rect()
-        if not rect or rect.width() < 10 or rect.height() < 10:
+        if not rect or rect.width() < 10 or rect.height() < 10 or not self.storage:
             page.clear_selection()
             self.cancel_capture()
             return
         img = self.engine.render_page(page.page_idx, page.width())
         cropped = img.copy(rect)
-        captures_dir = Path("captures")
-        captures_dir.mkdir(exist_ok=True)
-        base = Path(self.engine.path).stem if self.engine.path else "capture"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{base}_p{page.page_idx}_{ts}.png"
-        filepath = captures_dir / filename
-        cropped.save(str(filepath))
-        json_path = captures_dir / f"{base}_annotations.json"
-        data = {"captures": [], "highlights": []}
-        if json_path.exists():
-            try:
-                data = json.loads(json_path.read_text())
-            except Exception:
-                pass
-        data["captures"].append({
-            "type": "capture",
-            "page": page.page_idx,
-            "file": filename,
-            "timestamp": datetime.now().isoformat(),
-        })
-        json_path.write_text(json.dumps(data, indent=2))
-        self.status.showMessage(f"Capture saved: {filename}")
+        filepath, entry = self.storage.save_capture(page.page_idx, cropped)
+        rel = filepath.relative_to(self.storage.folder).as_posix()
+        self.notes_panel.append_markdown(
+            f"## Screen Capture — Page {page.page_idx + 1}\n\n"
+            f"![capture]({rel})\n\n"
+            f"_Page {page.page_idx + 1}_"
+        )
+        self.status.showMessage(f"Capture saved: {filepath.name}")
         page.clear_selection()
         self.cancel_capture()
 

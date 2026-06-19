@@ -6,5 +6,5 @@ __pycache__/
 *.pdb
 .DS_Store
 Thumbs.db
-captures/
+notes/
 test.pdf
