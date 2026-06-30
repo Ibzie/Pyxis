@@ -264,7 +264,7 @@ class NotesPanel(QWidget):
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(path)
         printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-        doc.print_(printer)
+        doc.print(printer)
 
     def on_save(self, callback):
         self._callback = callback
