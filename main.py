@@ -1,8 +1,8 @@
 import sys, json, os, logging, logging.handlers
 from datetime import datetime
 from pathlib import Path
-from PyQt6.QtCore import Qt, QPoint
-from PyQt6.QtGui import QColor, QKeyEvent, QCursor
+from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QKeyEvent, QCursor, QAction
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
@@ -15,6 +15,8 @@ from notes_panel import NotesPanel
 from storage import PdfStorage
 from ai_layer import AILayer, TIERS, detect_capacity, fit_level
 from ai_workers import LoadWorker, InferWorker, IndexWorker
+from speech import create_engine, SpeechQueue
+from narrator import NarratorWorker
 
 
 class MainWindow(QMainWindow):
@@ -36,6 +38,11 @@ class MainWindow(QMainWindow):
         self.rag_index = None
         self.index_worker = None
         self._rag_images = []
+        # Accessibility (TTS + narrator)
+        self._a11y_mode = False
+        self._speech_engine = None
+        self._speech_queue = None
+        self._narrator = None
         self.setWindowTitle("AI-PDF Reader")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #121212; color: #eeeeee;")
@@ -83,6 +90,8 @@ class MainWindow(QMainWindow):
         self.toolbar.addSeparator()
         self.toolbar.addWidget(QPushButton("☰", clicked=self.toggle_sidebar))
         self.toolbar.addWidget(QPushButton("📝", clicked=self.toggle_notes))
+        self.toolbar.addWidget(QPushButton("🎧", clicked=self.toggle_a11y,
+                                          checkable=True))
         self.toolbar.addSeparator()
         self.model_label = QPushButton("AI: idle")
         self.model_label.setStyleSheet(
@@ -170,6 +179,11 @@ class MainWindow(QMainWindow):
 
     def _on_index_done(self, rag):
         self.rag_index = rag
+        # Populate image-block bboxes on each PageView for hit-testing + focus.
+        for page in self.pages:
+            blocks = [c["image_rect"] for c in rag.chunks
+                      if c["page"] == page.page_idx and c.get("image_rect")]
+            page.set_image_blocks(blocks)
         self.status.showMessage("Index ready — Ask AI can now cite pages")
 
     def _on_index_failed(self, msg):
@@ -235,6 +249,7 @@ class MainWindow(QMainWindow):
             page = PageView(i, w_pt, h_pt)
             page.rightClicked.connect(self.show_context_menu)
             page.captureDone.connect(self.complete_capture)
+            page.describeImageRequested.connect(self._describe_image_at)
             page.set_chars(self.engine.get_text_chars(i))
             self.pages_layout.insertWidget(self.pages_layout.count() - 1, page)
             self.pages.append(page)
@@ -430,10 +445,21 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet(
             "QMenu { background-color: #1e1e1e; border: 1px solid #444; padding: 4px; }")
+        last_family = None
         for i, tier in enumerate(TIERS):
+            fam = tier.get("family", "")
+            if fam != last_family:
+                if last_family is not None:
+                    menu.addSeparator()
+                label = QAction(f"── {fam} {'(multimodal)' if tier.get('multimodal') else '(text only)'} ──", menu)
+                label.setEnabled(False)
+                label.setStyleSheet("QAction { color: #888; }")
+                menu.addAction(label)
+                last_family = fam
             fit, color = fit_level(tier["footprint"], ram)
+            mm = " 📷" if tier.get("multimodal") else ""
             btn = QPushButton(
-                f"\u25cf  {tier['name']:<26} {fit:<10} ~{tier['footprint']:.1f} GB")
+                f"\u25cf  {tier['name']:<26} {fit:<10} ~{tier['footprint']:.1f} GB{mm}")
             btn.setStyleSheet(
                 "QPushButton { text-align: left; padding: 8px 16px; border: none; "
                 "background: transparent; color: #eee; font-family: monospace; font-size: 13px; }"
@@ -601,15 +627,194 @@ class MainWindow(QMainWindow):
         self.ai.request_cancel()
         self.status.showMessage("AI: cancelling…")
 
+    # ── Accessibility (TTS + narrator) ─────────────────────────────────────
+    def toggle_a11y(self, checked=None):
+        """Toggle accessibility mode on/off."""
+        if checked is None:
+            # Called from keyboard shortcut (Ctrl+Shift+A).
+            checked = not self._a11y_mode
+        if checked and not self._a11y_mode:
+            self._a11y_on()
+        elif not checked and self._a11y_mode:
+            self._a11y_off()
+
+    def _a11y_on(self):
+        self._a11y_mode = True
+        self.status.showMessage("Accessibility: starting TTS engine…")
+        def on_tts_status(m):
+            self.status.showMessage(f"TTS: {m}")
+        try:
+            self._speech_engine = create_engine(on_status=on_tts_status)
+        except Exception as e:
+            self.status.showMessage(f"TTS unavailable: {e}")
+            self._a11y_mode = False
+            return
+        self._speech_queue = SpeechQueue(self._speech_engine, self)
+        self._speech_queue.chunk_started.connect(
+            lambda t: self.status.showMessage(f"🔊 {t[:60]}"))
+        self._speech_queue.start()
+        if self.ai.is_loaded():
+            self._narrator = NarratorWorker(
+                self.engine, self.rag_index, self.ai, self.storage,
+                self._speech_queue, self)
+            self._narrator.caption_ready.connect(self._on_caption_ready)
+            self._narrator.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
+        self.status.showMessage("Accessibility mode on — press R to read page, I to describe image")
+
+    def _a11y_off(self):
+        self._a11y_mode = False
+        if self._narrator:
+            self._narrator.cancel()
+            self._narrator = None
+        if self._speech_queue:
+            self._speech_queue.stop()
+            self._speech_queue = None
+        if self._speech_engine:
+            self._speech_engine.shutdown()
+            self._speech_engine = None
+        self.status.showMessage("Accessibility mode off")
+
+    def _read_current_page(self):
+        """Read the current page aloud via the narrator."""
+        if not self._a11y_mode:
+            self.toggle_a11y(True)
+        if not self.ai.is_loaded():
+            self.status.showMessage("Load an AI model first (AI menu)")
+            return
+        if not self.rag_index or not self.rag_index.is_ready:
+            self.status.showMessage("Indexing in progress — wait for index ready")
+            return
+        if self._narrator is None or not self._narrator.isRunning():
+            self._narrator = NarratorWorker(
+                self.engine, self.rag_index, self.ai, self.storage,
+                self._speech_queue, self)
+            self._narrator.caption_ready.connect(self._on_caption_ready)
+            self._narrator.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
+        self._narrator.read_page(self.current_page)
+        self.status.showMessage(f"Reading page {self.current_page + 1}…")
+
+    def _pause_narration(self):
+        """Pause/resume TTS playback."""
+        if self._speech_queue and self._speech_queue.isRunning():
+            if self._speech_engine and self._speech_engine.is_speaking():
+                self._speech_engine.cancel()
+                self.status.showMessage("Narration paused")
+            else:
+                self.status.showMessage("Narration resumed")
+
+    def _stop_narration(self):
+        """Stop all narration and clear the TTS queue."""
+        if self._speech_queue:
+            self._speech_queue.cancel()
+        self.status.showMessage("Narration stopped")
+
+    def _describe_next_image(self):
+        """Describe the next image on the current page."""
+        if not self.pages or self.current_page >= len(self.pages):
+            return
+        page = self.pages[self.current_page]
+        bbox = page.next_image()
+        if bbox is None:
+            self.status.showMessage("No more images on this page")
+            return
+        self._describe_image_at(page.page_idx, bbox)
+
+    def _describe_image_at(self, page_idx, bbox):
+        """Describe an image at the given page/bbox. Uses cache if available."""
+        if not self.ai.is_loaded():
+            self.status.showMessage("Load an AI model first (AI menu)")
+            return
+        if not self.ai.is_multimodal():
+            self.status.showMessage("Current model is text-only — switch to Gemma 4 for vision")
+            return
+        cached = self.storage.get_image_description(page_idx, bbox)
+        if cached:
+            desc = cached["description"]
+            self._on_caption_ready(desc, f"\n\n#### 📷 Page {page_idx+1} Figure\n\n{desc}\n")
+            if self._speech_queue:
+                self._speech_queue.enqueue(f"Image on page {page_idx + 1}. {desc}")
+            self.status.showMessage(f"Image (cached): {desc[:60]}")
+            return
+        # Extract image and describe via vision model.
+        import fitz
+        doc = fitz.open(self.engine.path)
+        try:
+            page = doc.load_page(page_idx)
+            pix = page.get_pixmap(clip=fitz.Rect(*bbox), matrix=fitz.Matrix(2, 2))
+            png_bytes = pix.tobytes("png")
+        finally:
+            doc.close()
+        self.status.showMessage(f"Describing image on page {page_idx+1}…")
+        class _ImgWorker(QThread):
+            done = pyqtSignal(str)
+            def __init__(self, ai, png_bytes):
+                super().__init__()
+                self.ai = ai
+                self.png = png_bytes
+            def run(self):
+                try:
+                    self.done.emit(self.ai.describe_image(self.png))
+                except Exception as e:
+                    self.done.emit(f"Description unavailable: {e}")
+        self._img_worker = _ImgWorker(self.ai, png_bytes)
+        desc_box = [None]
+        def on_desc(desc):
+            img_path = self.storage.save_rag_image(page_idx, fitz.Pixmap(pix))
+            self.storage.save_image_description(page_idx, bbox, desc, img_path)
+            rel = img_path.relative_to(self.storage.folder).as_posix()
+            self._on_caption_ready(desc, f"\n\n#### 📷 Page {page_idx+1} Figure\n\n{desc}\n\n![caption]({rel})\n")
+            if self._speech_queue:
+                self._speech_queue.enqueue(f"Image on page {page_idx + 1}. {desc}")
+            self.status.showMessage(f"Image: {desc[:60]}")
+        self._img_worker.done.connect(on_desc)
+        self._img_worker.start()
+
+    def _on_caption_ready(self, desc, md):
+        """Append a vision-model caption to the notes panel."""
+        self.notes_panel.append_markdown(md)
+
+    def _read_notes_aloud(self):
+        """Read the notes panel text via TTS."""
+        if not self._a11y_mode:
+            self.toggle_a11y(True)
+        text = self.notes_panel.get_text()
+        if text.strip():
+            self._speech_queue.enqueue(text)
+            self.status.showMessage("Reading notes…")
+
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
             if self.capture_mode:
                 self.cancel_capture()
+            elif self._a11y_mode and self._speech_engine and self._speech_engine.is_speaking():
+                self._stop_narration()
             elif self.ai_infer and self.ai_infer.isRunning():
                 self._cancel_ai()
             else:
                 self.clear_search()
             return
+        # Accessibility shortcuts (no modifiers needed)
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._a11y_mode:
+            k = event.key()
+            if k in (Qt.Key.Key_Space, Qt.Key.Key_P):
+                self._pause_narration()
+                return
+            elif k == Qt.Key.Key_R:
+                self._read_current_page()
+                return
+            elif k == Qt.Key.Key_S:
+                self._stop_narration()
+                return
+            elif k == Qt.Key.Key_I:
+                self._describe_next_image()
+                return
+            elif k == Qt.Key.Key_N:
+                self._read_notes_aloud()
+                return
+        if event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            if event.key() == Qt.Key.Key_A:
+                self.toggle_a11y()
+                return
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             if event.key() == Qt.Key.Key_O:
                 self.open_file()
@@ -621,8 +826,10 @@ class MainWindow(QMainWindow):
                 self._adjust_zoom(-1)
         elif event.modifiers() == Qt.KeyboardModifier.AltModifier:
             if event.key() == Qt.Key.Key_Right:
+                self._stop_narration()
                 self.next_page()
             elif event.key() == Qt.Key.Key_Left:
+                self._stop_narration()
                 self.prev_page()
 
     def resizeEvent(self, event):
@@ -631,7 +838,15 @@ class MainWindow(QMainWindow):
             self._apply_zoom()
 
     def closeEvent(self, event):
-        # Stop AI workers and free the model so failed runs don't leak RAM.
+        # Stop accessibility workers first (TTS + narrator).
+        if self._narrator:
+            self._narrator.cancel()
+            self._narrator.wait(3000)
+        if self._speech_queue:
+            self._speech_queue.stop()
+        if self._speech_engine:
+            self._speech_engine.shutdown()
+        # Stop AI workers and free the model.
         for w in (self.ai_loader, self.ai_infer, self.index_worker):
             if w and w.isRunning():
                 self.ai.request_cancel()

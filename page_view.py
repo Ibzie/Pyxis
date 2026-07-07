@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QLabel
 class PageView(QLabel):
     rightClicked = pyqtSignal(int, QPoint, QPointF)
     captureDone = pyqtSignal(int)
+    describeImageRequested = pyqtSignal(int, tuple)   # (page_idx, bbox)
 
     def __init__(self, page_idx, width_pt, height_pt, parent=None):
         super().__init__(parent)
@@ -20,6 +21,8 @@ class PageView(QLabel):
         self.drag_current = None
         self.capture_mode = False
         self.capture_rect = None
+        self.image_blocks = []        # list of (x0, y0, x1, y1) tuples
+        self._image_focus = None      # index into image_blocks being described
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("background-color: #1e1e1e;")
@@ -37,6 +40,35 @@ class PageView(QLabel):
     def set_highlights(self, highlights):
         self.highlights = highlights
         self.update()
+
+    def set_image_blocks(self, blocks):
+        """Set the list of image-region bboxes (x0, y0, x1, y1) for this page."""
+        self.image_blocks = list(blocks)
+        self._image_focus = None
+        self.update()
+
+    def next_image(self):
+        """Return the bbox of the next image block, or None if none left."""
+        if not self.image_blocks:
+            return None
+        start = (self._image_focus + 1) if self._image_focus is not None else 0
+        for i in range(start, len(self.image_blocks)):
+            self._image_focus = i
+            self.update()
+            return self.image_blocks[i]
+        return None
+
+    def set_image_focus(self, idx):
+        self._image_focus = idx
+        self.update()
+
+    def image_at(self, pos):
+        """Return (index, bbox) of the image under the cursor, or (None, None)."""
+        x, y = pos.x() / self.zoom, pos.y() / self.zoom
+        for i, bbox in enumerate(self.image_blocks):
+            if bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]:
+                return i, bbox
+        return None, None
 
     def clear_selection(self):
         self.selection = []
@@ -116,6 +148,12 @@ class PageView(QLabel):
             p.setPen(QPen(QColor(255, 87, 34), 2, Qt.PenStyle.DashLine))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(self.capture_rect)
+        if self.image_blocks and self._image_focus is not None:
+            p.setPen(QPen(QColor(255, 215, 0), 2, Qt.PenStyle.SolidLine))
+            p.setBrush(QColor(255, 215, 0, 30))
+            idx = self._image_focus
+            if 0 <= idx < len(self.image_blocks):
+                p.drawRect(self._pdf_to_screen(*self.image_blocks[idx]))
 
     def mousePressEvent(self, ev: QMouseEvent):
         if ev.button() == Qt.MouseButton.LeftButton:
@@ -128,6 +166,11 @@ class PageView(QLabel):
             self.update()
         elif ev.button() == Qt.MouseButton.RightButton:
             pdf_pos = self._screen_to_pdf(ev.pos())
+            idx, bbox = self.image_at(ev.pos())
+            if bbox:
+                self._image_focus = idx
+                self.update()
+                self.describeImageRequested.emit(self.page_idx, bbox)
             self.rightClicked.emit(self.page_idx, self.mapToGlobal(ev.pos()), pdf_pos)
 
     def mouseMoveEvent(self, ev: QMouseEvent):

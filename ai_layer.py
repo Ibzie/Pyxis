@@ -1,45 +1,64 @@
 import re
 import gc
+import base64
 import logging
 import platform
 
 log = logging.getLogger("ai_layer")
 
 # ── Model tiers ────────────────────────────────────────────────────────────
-# All repos below were verified to exist and contain .gguf files. The Qwen
-# official GGUF repos publish multi-shard quants (e.g. q4_k_m split into two
-# files); `resolve_quant` returns a glob so llama-cpp-python pulls every shard.
+# Two families live in one flat list (preserves `tier_idx` indexing used by
+# the model menu). `pick_model` only considers the Gemma 4 auto-pick family.
+# Gemma 4 (https://huggingface.co/unsloth/gemma-4-*) is multimodal — text +
+# image + audio (E2B/E4B) — so the AI can describe PDF figures for blind
+# users. Qwen2.5 is retained as a text-only fallback for users who want
+# maximum pure-text quality and don't need image understanding.
 TIERS = [
-    {
-        "min_ram": 16, "name": "Qwen2.5-14B-Instruct", "footprint": 10.5,
-        "repos": ["Qwen/Qwen2.5-14B-Instruct-GGUF"],
-        "quants": ["Q5_K_M", "Q4_K_M", "Q3_K_M"],
-    },
-    {
-        "min_ram": 14, "name": "Qwen2.5-14B-Instruct", "footprint": 9.5,
-        "repos": ["Qwen/Qwen2.5-14B-Instruct-GGUF"],
-        "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M"],
-    },
-    {
-        "min_ram": 12, "name": "Gemma-4-12B-it", "footprint": 7.5,
-        "repos": ["unsloth/gemma-4-12b-it-GGUF", "unsloth/gemma-3-12b-it-GGUF"],
-        "quants": ["Q4_K_M", "IQ4_XS", "Q5_K_M", "Q3_K_M"],
-    },
-    {
-        "min_ram": 10, "name": "Qwen2.5-7B-Instruct", "footprint": 4.7,
-        "repos": ["Qwen/Qwen2.5-7B-Instruct-GGUF"],
-        "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M"],
-    },
-    {
-        "min_ram": 8, "name": "Qwen2.5-3B-Instruct", "footprint": 2.0,
-        "repos": ["Qwen/Qwen2.5-3B-Instruct-GGUF"],
-        "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M", "Q4_0"],
-    },
+    # ── Gemma 4 family (auto-pick, multimodal) ──────────────────────────────
+    {"min_ram": 16, "name": "Gemma 4 12B-it", "footprint": 7.5, "family": "Gemma 4",
+     "multimodal": True,
+     "repos": ["unsloth/gemma-4-12b-it-GGUF"],
+     "quants": ["Q4_K_M", "IQ4_XS", "Q5_K_M", "Q3_K_M"]},
+    {"min_ram": 14, "name": "Gemma 4 12B-it", "footprint": 6.8, "family": "Gemma 4",
+     "multimodal": True,
+     "repos": ["unsloth/gemma-4-12b-it-GGUF"],
+     "quants": ["IQ4_XS", "Q4_K_M", "Q3_K_M"]},
+    {"min_ram": 12, "name": "Gemma 4 E4B-it", "footprint": 5.5, "family": "Gemma 4",
+     "multimodal": True,
+     "repos": ["unsloth/gemma-4-E4B-it-GGUF"],
+     "quants": ["Q4_K_M", "IQ4_XS", "Q5_K_M", "Q3_K_M"]},
+    {"min_ram": 10, "name": "Gemma 4 E4B-it", "footprint": 5.0, "family": "Gemma 4",
+     "multimodal": True,
+     "repos": ["unsloth/gemma-4-E4B-it-GGUF"],
+     "quants": ["IQ4_XS", "Q4_K_M", "Q3_K_M"]},
+    {"min_ram": 8, "name": "Gemma 4 E2B-it", "footprint": 3.5, "family": "Gemma 4",
+     "multimodal": True,
+     "repos": ["unsloth/gemma-4-E2B-it-GGUF"],
+     "quants": ["Q4_K_M", "IQ4_XS", "Q3_K_M", "Q4_0"]},
+    # ── Qwen2.5 family (text-only, manual selection) ───────────────────────
+    {"min_ram": 16, "name": "Qwen2.5-14B-Instruct", "footprint": 10.5, "family": "Qwen2.5",
+     "multimodal": False,
+     "repos": ["Qwen/Qwen2.5-14B-Instruct-GGUF"],
+     "quants": ["Q5_K_M", "Q4_K_M", "Q3_K_M"]},
+    {"min_ram": 14, "name": "Qwen2.5-14B-Instruct", "footprint": 9.5, "family": "Qwen2.5",
+     "multimodal": False,
+     "repos": ["Qwen/Qwen2.5-14B-Instruct-GGUF"],
+     "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M"]},
+    {"min_ram": 10, "name": "Qwen2.5-7B-Instruct", "footprint": 4.7, "family": "Qwen2.5",
+     "multimodal": False,
+     "repos": ["Qwen/Qwen2.5-7B-Instruct-GGUF"],
+     "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M"]},
+    {"min_ram": 8, "name": "Qwen2.5-3B-Instruct", "footprint": 2.0, "family": "Qwen2.5",
+     "multimodal": False,
+     "repos": ["Qwen/Qwen2.5-3B-Instruct-GGUF"],
+     "quants": ["Q4_K_M", "Q5_K_M", "Q3_K_M", "Q4_0"]},
 ]
 
 HEADROOM_GB = 2.5
 N_CTX = 8192
 MAX_TOKENS = 700
+MAX_IMG_TOKENS = 400
+MMPROJ_FILENAME = "mmproj-F16.gguf"
 
 # KV-cache quant: `type_k` takes the ggml type *integer* enum (not a string).
 # We only quantize the K cache (q8_0, near-lossless); quantizing V to q4_0 is
@@ -76,13 +95,18 @@ def detect_capacity():
 
 
 def pick_model(ram_gb):
-    """Auto-pick the largest model that fits with EASY headroom (1.5x + 2.5 GB)
-    so the first-run download is reasonably sized. Tight/Overflow models are
-    still available via the manual dropdown."""
+    """Auto-pick the largest Gemma 4 (multimodal) model that fits with EASY
+    headroom (1.5x + 2.5 GB) so the first-run download is reasonably sized.
+    Qwen2.5 (text-only) and Tight/Overflow tiers are still available via the
+    manual dropdown in the model menu."""
     for tier in TIERS:
+        if tier.get("family") != "Gemma 4":
+            continue
         if ram_gb >= tier["min_ram"] and ram_gb >= tier["footprint"] * 1.5 + HEADROOM_GB:
             return tier
-    return TIERS[-1]
+    # Fall back to smallest Gemma 4 if nothing fits — never auto-pick Qwen2.5.
+    gemma4 = [t for t in TIERS if t.get("family") == "Gemma 4"]
+    return gemma4[-1] if gemma4 else TIERS[-1]
 
 
 def fit_level(footprint, ram_gb):
@@ -198,6 +222,10 @@ class AILayer:
         self.filename = None
         self.accel = "cpu"
         self._cancel = False
+        self._handler = None      # Gemma4ChatHandler (vision), or None for text-only tiers
+
+    def is_multimodal(self):
+        return bool(self.tier and self.tier.get("multimodal") and self._handler)
 
     # ── loading ────────────────────────────────────────────────────────────
     def load_model(self, on_status=None, on_progress=None, repo_id=None, filename=None, tier_idx=None):
@@ -206,12 +234,33 @@ class AILayer:
         if on_status:
             on_status(f"Detected {ram:.1f} GB RAM, accelerator: {self.accel}")
         self.tier = TIERS[tier_idx] if tier_idx is not None else pick_model(ram)
-        log.info("tier: %s (footprint %.1f GB)", self.tier["name"], self.tier["footprint"])
+        log.info("tier: %s (footprint %.1f GB, multimodal=%s)",
+                 self.tier["name"], self.tier["footprint"], self.tier.get("multimodal"))
         self.repo_id = repo_id or self._first_available_repo(self.tier["repos"], on_status)
         files = [filename] if filename else resolve_quant(
             self.repo_id, self.tier["quants"], on_status)
         self.filename = files[0]
         self._download(files, on_status, on_progress)
+        # Multimodal tiers (Gemma 4) need the mmproj sidecar so the loaded
+        # model can process images. We download and attach a Gemma4ChatHandler
+        # up-front; text-only inference is unaffected.
+        handler = None
+        if self.tier.get("multimodal"):
+            self._download([MMPROJ_FILENAME], on_status, on_progress)
+            if on_status:
+                on_status("Preparing vision projector…")
+            try:
+                from llama_cpp.llama_chat_format import Gemma4ChatHandler
+                handler = Gemma4ChatHandler.from_pretrained(
+                    repo_id=self.repo_id, filename=MMPROJ_FILENAME,
+                    use_gpu=self.accel != "cpu", verbose=False,
+                )
+                log.info("vision handler ready: %s", MMPROJ_FILENAME)
+            except Exception as e:
+                log.warning("vision handler unavailable: %s", e)
+                if on_status:
+                    on_status(f"Vision unavailable (continuing text-only): {e}")
+        self._handler = handler
         kvk = KV_K_LOSSLESS if ram >= 12 else KV_K_TIGHT
         if on_status:
             on_status(f"Loading {self.tier['name']} ({self.quant_label()})…")
@@ -235,6 +284,8 @@ class AILayer:
             )
             if len(files) > 1:
                 kwargs["additional_files"] = files[1:]
+            if handler is not None:
+                kwargs["chat_handler"] = handler
             try:
                 log.info("load attempt n_ctx=%d n_gpu=%d kv=%s", n_ctx, n_gpu, _kvk)
                 self.llm = Llama.from_pretrained(**kwargs)
@@ -250,13 +301,19 @@ class AILayer:
         log.info("loaded: %s, n_ctx=%d", self.tier['name'], self._loaded_n_ctx)
 
     def unload(self):
-        """Release the loaded model and reclaim resident RAM immediately."""
+        """Release the loaded model and vision handler, reclaim resident RAM."""
         if self.llm is not None:
             try:
                 del self.llm
             except Exception:
                 pass
         self.llm = None
+        if self._handler is not None:
+            try:
+                del self._handler
+            except Exception:
+                pass
+        self._handler = None
         gc.collect()
 
     def _download(self, files, on_status=None, on_progress=None):
@@ -374,12 +431,17 @@ class AILayer:
         return [{"role": "system", "content": sys}, {"role": "user", "content": user}], heading
 
     # ── inference ──────────────────────────────────────────────────────────
-    def generate(self, messages, on_token=None):
+    def generate(self, messages, on_token=None, enable_thinking=False):
         if not self.llm:
             raise RuntimeError("AI model not loaded")
         self.reset_cancel()
+        # Gemma 4 thinking is toggled by a `<|think|>` token at the start of
+        # the system prompt (per the model card). We inject it when the caller
+        # asks for thinking, omit it otherwise. Non-Gemma models ignore the
+        # token harmlessly.
+        msgs = self._with_thinking(messages, enable_thinking)
         stream = self.llm.create_chat_completion(
-            messages=messages, stream=True, max_tokens=MAX_TOKENS
+            messages=msgs, stream=True, max_tokens=MAX_TOKENS
         )
         for chunk in stream:
             if self._cancel:
@@ -388,3 +450,49 @@ class AILayer:
             token = delta.get("content")
             if token and on_token:
                 on_token(token)
+
+    @staticmethod
+    def _with_thinking(messages, enable_thinking):
+        if not enable_thinking or not messages:
+            return messages
+        out = list(messages)
+        if out[0].get("role") == "system":
+            out[0] = dict(out[0])
+            out[0]["content"] = "<|think|>\n" + out[0].get("content", "")
+        return out
+
+    # ── vision (image description for accessibility) ───────────────────────
+    def describe_image(self, image_bytes, prompt=None, enable_thinking=False):
+        """Describe a PNG/JPEG for a blind reader. Returns the caption text.
+
+        Raises RuntimeError if the loaded model is text-only (e.g. user
+        manually picked Qwen2.5 from the model menu)."""
+        if not self.llm:
+            raise RuntimeError("AI model not loaded")
+        if not self.is_multimodal():
+            raise RuntimeError(
+                "Current model is text-only. Switch to a Gemma 4 tier in the "
+                "AI menu to describe images.")
+        if prompt is None:
+            prompt = (
+                "Describe this image for a blind reader. State the type "
+                "(chart, photo, diagram, screenshot, table, or other), the "
+                "key visible content, any text in the image, and the overall "
+                "purpose. Keep it to 2-4 sentences."
+            )
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:image/png;base64,{b64}"
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": prompt},
+            ],
+        }]
+        if enable_thinking:
+            messages = [{"role": "system", "content": "<|think|>\nYou are a vision assistant."}] + messages
+        log.info("describe_image: %d bytes, thinking=%s", len(image_bytes), enable_thinking)
+        resp = self.llm.create_chat_completion(
+            messages=messages, stream=False, max_tokens=MAX_IMG_TOKENS,
+        )
+        return resp["choices"][0]["message"]["content"].strip()

@@ -14,7 +14,12 @@ class PdfStorage:
         self.notes_file = self.folder / "notes.md"
         self.annotations_file = self.folder / "annotations.json"
         self._ensure_dirs()
-        self.annotations = self._load_json(self.annotations_file, {"highlights": [], "captures": []})
+        self.annotations = self._load_json(
+            self.annotations_file,
+            {"highlights": [], "captures": [], "image_descriptions": {}},
+        )
+        if "image_descriptions" not in self.annotations:
+            self.annotations["image_descriptions"] = {}
 
     def _safe_name(self, name):
         return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
@@ -98,4 +103,23 @@ class PdfStorage:
             else:
                 kept.append(h)
         self.annotations["highlights"] = kept
+        self._save_json(self.annotations_file, self.annotations)
+
+    # ── image descriptions (accessibility) ─────────────────────────────────
+    def _img_key(self, page_idx, bbox):
+        return f"{page_idx}_{tuple(round(v, 1) for v in bbox)}"
+
+    def get_image_description(self, page_idx, bbox):
+        """Return cached description for an image region, or None."""
+        return self.annotations.get("image_descriptions", {}).get(
+            self._img_key(page_idx, bbox))
+
+    def save_image_description(self, page_idx, bbox, description, img_path=None):
+        """Cache an AI-generated image description so we skip the model on
+        subsequent openings of the same PDF."""
+        key = self._img_key(page_idx, bbox)
+        entry = {"description": description, "timestamp": self._now_iso()}
+        if img_path:
+            entry["file"] = str(Path(img_path).relative_to(self.folder))
+        self.annotations.setdefault("image_descriptions", {})[key] = entry
         self._save_json(self.annotations_file, self.annotations)
