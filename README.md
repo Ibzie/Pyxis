@@ -105,6 +105,17 @@ Right-clicking an image region triggers description immediately.
 
 Python, [PyQt6](https://riverbankcomputing.com/software/pyqt/), [PyMuPDF](https://pymupdf.readthedocs.io/), [llama.cpp](https://github.com/ggml-org/llama.cpp) (via `llama-cpp-python`), [Gemma 4](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) (multimodal), [Piper TTS](https://github.com/rhasspy/piper).
 
+## Release a new version
+
+Push a `v*` tag and GitHub Actions builds + publishes the release automatically:
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+CI builds the Linux AppImage and Windows EXE in parallel, then creates a GitHub Release with both binaries attached. Watch the build at `Actions` tab. The release goes live at `releases/tag/v1.1.0` when both jobs finish (~15-20 min).
+
 ## License
 
 MIT
