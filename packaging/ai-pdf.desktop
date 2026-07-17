@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AI-PDF
+Comment=PDF reader with AI notes and accessibility
+Exec=AppRun %f
+Icon=ai-pdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;

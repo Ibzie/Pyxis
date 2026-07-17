@@ -1,44 +1,92 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── Build AI-PDF for Linux ────────────────────────────────────────────────
-# Produces:  dist/AI-PDF/                 (onedir bundle)
-#            AI-PDF-linux-x64.tar.gz      (distributable tarball)
+# ── Build AI-PDF AppImage for Linux ───────────────────────────────────────
+# Produces: dist/AI-PDF-x86_64.AppImage
 #
-# Run on a Linux x86_64 machine with:
-#   - Python 3.10+ venv at .venv/
-#   - requirements.txt installed (CPU llama-cpp-python is fine — the app
-#     auto-downloads the CUDA lib on first run if a GPU is detected)
-#   - PyInstaller installed (pip install pyinstaller)
+# Prerequisites:
+#   - Python 3.10+ venv at .venv/ with requirements.txt + pyinstaller installed
+#   - appimagetool downloaded automatically if missing
+#
+# The AppImage is a single executable file that mounts via FUSE and runs
+# without installation. Users just: chmod +x AI-PDF-x86_64.AppImage && ./AI-PDF-x86_64.AppImage
 
 cd "$(dirname "$0")/.."
-echo "=== AI-PDF Linux Build ==="
+echo "=== AI-PDF Linux AppImage Build ==="
 
 # Clean previous builds
-rm -rf build/ dist/AI-PDF/
+rm -rf build/ dist/AI-PDF/ dist/AppDir/ dist/AI-PDF-x86_64.AppImage
 mkdir -p dist
 
-# Run PyInstaller
-echo "--- Running PyInstaller..."
-python -m PyInstaller packaging/ai-pdf.spec --noconfirm --clean
+# ── Step 1: PyInstaller onedir build ──────────────────────────────────────
+echo "--- Running PyInstaller (onedir)..."
+.venv/bin/python -m PyInstaller packaging/ai-pdf.spec --noconfirm --clean
 
-# Verify the bundle exists
 if [ ! -d "dist/AI-PDF" ]; then
-    echo "ERROR: dist/AI-PDF/ not created — build failed"
+    echo "ERROR: dist/AI-PDF/ not created — PyInstaller build failed"
+    exit 1
+fi
+BUNDLE_SIZE=$(du -sh dist/AI-PDF/ | cut -f1)
+echo "  Bundle: dist/AI-PDF/ ($BUNDLE_SIZE)"
+
+# ── Step 2: Assemble AppDir ───────────────────────────────────────────────
+echo "--- Assembling AppDir..."
+APPDIR="dist/AppDir"
+mkdir -p "$APPDIR/usr/bin"
+mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+
+# Copy the PyInstaller bundle into usr/bin/
+cp -r dist/AI-PDF "$APPDIR/usr/bin/AI-PDF"
+
+# Copy AppRun (entry point) and desktop file
+cp packaging/AppRun "$APPDIR/AppRun"
+chmod +x "$APPDIR/AppRun"
+cp packaging/ai-pdf.desktop "$APPDIR/ai-pdf.desktop"
+
+# Copy icon
+if [ -f "packaging/icons/ai-pdf.png" ]; then
+    cp packaging/icons/ai-pdf.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/ai-pdf.png"
+    # Also place at root for AppImage discovery
+    cp packaging/icons/ai-pdf.png "$APPDIR/ai-pdf.png"
+else
+    echo "  Warning: icon not found — AppImage will use default icon"
+fi
+
+# ── Step 3: Download appimagetool if missing ──────────────────────────────
+TOOL="$HOME/.local/bin/appimagetool"
+if [ ! -x "$TOOL" ]; then
+    echo "--- Downloading appimagetool..."
+    mkdir -p "$(dirname "$TOOL")"
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "x86_64" ]; then
+        URL="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+    else
+        URL="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage"
+    fi
+    curl -fsSL "$URL" -o "$TOOL"
+    chmod +x "$TOOL"
+    echo "  Downloaded appimagetool to $TOOL"
+fi
+
+# ── Step 4: Build AppImage ────────────────────────────────────────────────
+echo "--- Building AppImage..."
+VERSION="${AIPDF_VERSION:-1.0.0}"
+ARCH=$(uname -m | sed 's/x86_64/x86_64/' | sed 's/aarch64/aarch64/')
+OUTPUT="dist/AI-PDF-${VERSION}-${ARCH}.AppImage"
+
+# appimagetool needs ARCH env var
+export ARCH
+"$TOOL" "$APPDIR" "$OUTPUT" --no-appstream
+
+if [ ! -f "$OUTPUT" ]; then
+    echo "ERROR: AppImage not created"
     exit 1
 fi
 
-# Quick smoke test (headless)
-echo "--- Smoke test (headless)..."
-QT_QPA_PLATFORM=offscreen ./dist/AI-PDF/AI-PDF --help 2>/dev/null || true
-
-# Create tarball
-echo "--- Creating tarball..."
-tar czf dist/AI-PDF-linux-x64.tar.gz -C dist AI-PDF
-SIZE=$(du -sh dist/AI-PDF-linux-x64.tar.gz | cut -f1)
+APPIMAGE_SIZE=$(du -sh "$OUTPUT" | cut -f1)
 echo ""
 echo "=== Build complete ==="
-echo "  Bundle:  dist/AI-PDF/"
-echo "  Tarball: dist/AI-PDF-linux-x64.tar.gz ($SIZE)"
+echo "  AppImage: $OUTPUT ($APPIMAGE_SIZE)"
 echo ""
-echo "To install: ./packaging/install_linux.sh dist/AI-PDF-linux-x64.tar.gz"
+echo "  To run:   chmod +x $OUTPUT && ./$OUTPUT"
+echo "  To install: mv $OUTPUT ~/.local/bin/ai-pdf (or any PATH dir)"
