@@ -94,6 +94,79 @@ def detect_capacity():
     return ram, accel
 
 
+def ensure_gpu_native(on_status=None):
+    """If the bundled llama-cpp-python is CPU-only but a CUDA GPU is detected,
+    download a CUDA-built ``libllama`` shared library into the app's data
+    directory and prepend that directory to ``LD_LIBRARY_PATH`` / ``PATH``.
+
+    Returns True if the app should restart to pick up the new library.
+    The caller (``main.py``) is responsible for actually restarting."""
+    import sys
+    if sys.platform == "darwin":
+        return False   # Metal is built into the default wheel; no swap needed
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        pynvml.nvmlShutdown()
+    except Exception:
+        return False   # no NVIDIA GPU → nothing to do
+    # Check if the bundled llama already supports CUDA.
+    try:
+        from llama_cpp import Llama
+        # Heuristic: if llama.cpp was built with CUDA, the ggml-cuda lib is
+        # loaded at import time. We can check by looking at loaded shared libs.
+        import llama_cpp
+        lib_dir = Path(llama_cpp.__file__).parent
+        has_cuda = any(
+            ("cuda" in f.name.lower() or "cublas" in f.name.lower())
+            for f in lib_dir.rglob("*")
+        )
+        if has_cuda:
+            return False   # already GPU-enabled
+    except Exception:
+        pass
+    # Download the CUDA-built libllama for this platform.
+    from storage import app_data_dir
+    native_dir = app_data_dir() / "native"
+    native_dir.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        lib_name = "llama.dll"
+        asset_name = "llama-cuda-win-x64.dll"
+    else:
+        lib_name = "libllama.so"
+        asset_name = "libllama-cuda12-linux-x64.so"
+    lib_path = native_dir / lib_name
+    if lib_path.exists():
+        _inject_native_dir(native_dir)
+        return False   # already downloaded — just inject and continue
+    if on_status:
+        on_status("Downloading CUDA build for faster AI (~15 MB)…")
+    try:
+        from huggingface_hub import hf_hub_download
+        # Host the CUDA libs in a dedicated HF repo (or GitHub releases).
+        # Using HF keeps the download path consistent with model downloads.
+        downloaded = hf_hub_download(
+            repo_id="ai-pdf/native-libs",
+            filename=asset_name,
+            cache_dir=str(native_dir.parent / "native-cache"),
+        )
+        import shutil
+        shutil.copy2(downloaded, lib_path)
+    except Exception as e:
+        log.warning("CUDA lib download failed: %s", e)
+        return False
+    _inject_native_dir(native_dir)
+    return True   # restart recommended — native lib loads at import time
+
+
+def _inject_native_dir(native_dir):
+    """Prepend the native-lib dir to the library search path."""
+    import os
+    path_var = "PATH" if sys.platform == "win32" else "LD_LIBRARY_PATH"
+    current = os.environ.get(path_var, "")
+    os.environ[path_var] = str(native_dir) + (os.pathsep + current if current else "")
+
+
 def pick_model(ram_gb):
     """Auto-pick the largest Gemma 4 (multimodal) model that fits with EASY
     headroom (1.5x + 2.5 GB) so the first-run download is reasonably sized.
@@ -318,6 +391,9 @@ class AILayer:
 
     def _download(self, files, on_status=None, on_progress=None):
         from huggingface_hub import hf_hub_download
+        from storage import app_data_dir
+        cache_dir = app_data_dir() / "models"
+        cache_dir.mkdir(parents=True, exist_ok=True)
         _SignalTqdm._callback = on_progress
         try:
             for i, fn in enumerate(files, 1):
@@ -325,7 +401,7 @@ class AILayer:
                     on_status(f"Downloading {fn} ({i}/{len(files)})…")
                 hf_hub_download(
                     repo_id=self.repo_id, filename=fn,
-                    tqdm_class=_SignalTqdm,
+                    cache_dir=str(cache_dir), tqdm_class=_SignalTqdm,
                 )
         finally:
             _SignalTqdm._callback = None

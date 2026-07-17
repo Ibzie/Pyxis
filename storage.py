@@ -1,10 +1,27 @@
 import json
+import os
+import sys
 from pathlib import Path
 from datetime import datetime
 
 
+def app_data_dir():
+    """OS-specific writable data directory for AI-PDF.
+
+    Linux:  ~/.local/share/ai-pdf/
+    macOS:  ~/Library/Application Support/ai-pdf/
+    Windows: %APPDATA%\\ai-pdf\\
+    """
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "ai-pdf"
+    elif sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", Path.home())) / "ai-pdf"
+    else:
+        return Path.home() / ".local" / "share" / "ai-pdf"
+
+
 class PdfStorage:
-    BASE_DIR = Path("notes")
+    BASE_DIR = app_data_dir() / "notes"
 
     def __init__(self, pdf_path):
         self.pdf_path = Path(pdf_path)

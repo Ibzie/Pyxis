@@ -860,9 +860,12 @@ def main():
     # Lean AI logging to ai.log (rotates at 1 MB, keeps 1 backup).
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    from storage import app_data_dir
+    log_dir = app_data_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         handlers=[logging.handlers.RotatingFileHandler(
-            "ai.log", maxBytes=1_000_000, backupCount=1)],
+            str(log_dir / "ai.log"), maxBytes=1_000_000, backupCount=1)],
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     app = QApplication(sys.argv)

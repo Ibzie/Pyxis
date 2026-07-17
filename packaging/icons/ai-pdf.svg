@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Background: rounded rect with dark gradient -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a2a3e"/>
+      <stop offset="100%" stop-color="#1a1a2e"/>
+    </linearGradient>
+    <linearGradient id="doc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#e8e8e8"/>
+      <stop offset="100%" stop-color="#c8c8c8"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="url(#bg)"/>
+  <!-- Document shape -->
+  <rect x="64" y="48" width="128" height="160" rx="8" fill="url(#doc)"/>
+  <!-- Folded corner -->
+  <path d="M 168 48 L 192 48 L 192 72 Z" fill="#a0a0a0"/>
+  <path d="M 168 48 L 192 72 L 168 72 Z" fill="#888"/>
+  <!-- Text lines -->
+  <rect x="80" y="88" width="80" height="6" rx="2" fill="#999"/>
+  <rect x="80" y="104" width="96" height="6" rx="2" fill="#999"/>
+  <rect x="80" y="120" width="64" height="6" rx="2" fill="#999"/>
+  <rect x="80" y="136" width="88" height="6" rx="2" fill="#999"/>
+  <!-- AI brain glyph (blue circle with circuit pattern) -->
+  <circle cx="128" cy="184" r="28" fill="#4a90d9" opacity="0.9"/>
+  <circle cx="128" cy="184" r="20" fill="#5ba0e9"/>
+  <!-- Circuit dots -->
+  <circle cx="120" cy="176" r="3" fill="#fff"/>
+  <circle cx="136" cy="176" r="3" fill="#fff"/>
+  <circle cx="128" cy="184" r="3" fill="#fff"/>
+  <circle cx="120" cy="192" r="3" fill="#fff"/>
+  <circle cx="136" cy="192" r="3" fill="#fff"/>
+  <!-- Circuit lines -->
+  <line x1="120" y1="176" x2="128" y2="184" stroke="#fff" stroke-width="1.5"/>
+  <line x1="136" y1="176" x2="128" y2="184" stroke="#fff" stroke-width="1.5"/>
+  <line x1="128" y1="184" x2="120" y2="192" stroke="#fff" stroke-width="1.5"/>
+  <line x1="128" y1="184" x2="136" y2="192" stroke="#fff" stroke-width="1.5"/>
+</svg>
