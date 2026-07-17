@@ -8,3 +8,17 @@ __pycache__/
 Thumbs.db
 notes/
 test.pdf
+# Build artifacts — never commit these (they exceed GitHub's 100 MB limit)
+dist/
+build/
+*.AppImage
+*.app
+*.exe
+*.dmg
+*.pkg
+# AI model cache (can be multi-GB)
+models/
+voices/
+native/
+ai.log
+ai.log.*
