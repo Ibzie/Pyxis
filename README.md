@@ -1,6 +1,8 @@
 # Pyxis
 
-A local-first PDF reader with AI notes, vision, and accessibility for blind users. 100% offline — your data never leaves your machine.
+> An all-local AI document reader suite for the ultimate learner.
+
+Pyxis is a local-first PDF reader with multimodal AI built in. It reads pages aloud via neural TTS, describes images and charts for blind users, answers questions about your documents with RAG-grounded citations, and writes WYSIWYG Markdown notes alongside every PDF. The AI model (Gemma 4), the TTS engine (Piper), and your documents all run entirely on your machine — no cloud, no API keys, no telemetry.
 
 ## Features
 
