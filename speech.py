@@ -14,7 +14,7 @@ from pathlib import Path
 
 log = logging.getLogger("speech")
 
-VOICE_CACHE_DIR = Path.home() / ".local" / "share" / "ai-pdf" / "voices"
+VOICE_CACHE_DIR = Path.home() / ".local" / "share" / "pyxis" / "voices"
 VOICE_REPO = "rhasspy/piper-voices"
 VOICE_PATH = "en/en_US/lessac/medium"
 VOICE_MODEL = "en_US-lessac-medium.onnx"

@@ -34,7 +34,7 @@ Single-binary Python app: a native GUI PDF reader with integrated Markdown notes
 
 ## Accessibility (blind users)
 - Toggle via 🎧 toolbar button or `Ctrl+Shift+A`. When on:
-  - Piper TTS engine downloads a ~65 MB voice file on first run (`~/.local/share/ai-pdf/voices/`).
+  - Piper TTS engine downloads a ~65 MB voice file on first run (`~/.local/share/pyxis/voices/`).
   - `NarratorWorker` reads pages aloud: paragraph/table text → TTS; image chunks → Gemma 4 vision model → caption appended to notes + spoken.
   - Image descriptions are cached in `annotations.json["image_descriptions"]` so re-opening a PDF skips re-running the model.
 - Keyboard shortcuts (only active when a11y is on):

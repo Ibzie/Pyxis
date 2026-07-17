@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for AI-PDF.
+"""PyInstaller spec for Pyxis.
 
-Supports two modes via the AIPDF_ONEFILE env var:
-  - AIPDF_ONEFILE=1  → single .exe (Windows portable)
+Supports two modes via the PYXIS_ONEFILE env var:
+  - PYXIS_ONEFILE=1  → single .exe (Windows portable)
   - default          → onedir (for Linux AppImage)
 
 Build:
   Linux:  ./packaging/build_linux.sh        (onedir → AppImage)
-  Windows: packaging\\build_windows.bat      (onefile → AI-PDF.exe)
+  Windows: packaging\\build_windows.bat      (onefile → Pyxis.exe)
 """
 
 import sys
@@ -16,7 +16,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 PROJECT_ROOT = os.path.dirname(SPEC_DIR)
-ONEFILE = os.environ.get("AIPDF_ONEFILE", "") == "1"
+ONEFILE = os.environ.get("PYXIS_ONEFILE", "") == "1"
 
 # ── Collect native binaries + data from heavy deps ────────────────────────
 pyqt6_bins, pyqt6_datas, pyqt6_hidden = collect_all("PyQt6")
@@ -28,9 +28,6 @@ rf_bins, rf_datas, rf_hidden = collect_all("rapidfuzz")
 sd_hidden = collect_submodules("sounddevice")
 
 # ── Filter out unused Qt6 modules (saves ~400 MB) ─────────────────────────
-# PyInstaller's collect_all grabs every Qt6 .so; excludes only prevent Python
-# imports, not binary files. We filter the binary/data lists directly so the
-# trimming works for both onedir and onefile builds.
 _QT_BIN_SKIP = (
     "libQt6WebEngine", "libQt6WebSockets", "libQt6WebView",
     "libQt6Qml", "libQt6Quick", "libQt6Quick3D", "libQt63D",
@@ -58,7 +55,6 @@ def _skip_bin(name):
     return any(base.startswith(s) for s in _QT_BIN_SKIP)
 
 def _skip_data(name):
-    # name is like "PyQt6/Qt6/qml/..." — check path segments
     norm = name.replace("\\", "/")
     return any(s in norm for s in _QT_DATA_SKIP_DIRS)
 
@@ -67,7 +63,6 @@ all_bins = (pyqt6_bins + fitz_bins + llama_bins + piper_bins
 all_datas = (pyqt6_datas + fitz_datas + llama_datas + piper_datas
              + onnx_datas + rf_datas)
 
-# Filter and report
 _orig_bin = len(all_bins)
 all_bins = [tuple(b) for b in all_bins if not _skip_bin(b[0])]
 _orig_data = len(all_datas)
@@ -124,17 +119,15 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-_icon = (os.path.join(SPEC_DIR, "icons", "ai-pdf.ico") if sys.platform == "win32"
-         else os.path.join(SPEC_DIR, "icons", "ai-pdf.icns") if sys.platform == "darwin"
+_icon = (os.path.join(SPEC_DIR, "icons", "pyxis.ico") if sys.platform == "win32"
+         else os.path.join(SPEC_DIR, "icons", "pyxis.icns") if sys.platform == "darwin"
          else None)
 
 if ONEFILE:
     # ── Single-file mode (Windows portable exe) ───────────────────────────
-    # Everything packed into one .exe. Slower startup (~5s extraction to temp
-    # on first run) but simplest distribution — no install needed.
     exe = EXE(
         pyz, a.scripts, a.binaries, a.datas,
-        name="AI-PDF",
+        name="Pyxis",
         debug=False,
         strip=False,
         upx=True,
@@ -153,7 +146,7 @@ else:
     exe = EXE(
         pyz, a.scripts, [],
         exclude_binaries=True,
-        name="AI-PDF",
+        name="Pyxis",
         debug=False,
         strip=False,
         upx=True,
@@ -172,5 +165,5 @@ else:
         strip=False,
         upx=True,
         upx_exclude=[],
-        name="AI-PDF",
+        name="Pyxis",
     )

@@ -8,6 +8,7 @@ __pycache__/
 Thumbs.db
 notes/
 test.pdf
+video/
 # Build artifacts — never commit these (they exceed GitHub's 100 MB limit)
 dist/
 build/

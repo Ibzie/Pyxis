@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
 # AppImage entry point — runs the PyInstaller onedir bundle.
-# AppRun is executed from the AppImage's mount point (self-contained).
 HERE="$(dirname "$(readlink -f "${0}")")"
-exec "${HERE}/usr/bin/AI-PDF/AI-PDF" "$@"
+exec "${HERE}/usr/bin/Pyxis/Pyxis" "$@"

@@ -43,7 +43,7 @@ class MainWindow(QMainWindow):
         self._speech_engine = None
         self._speech_queue = None
         self._narrator = None
-        self.setWindowTitle("AI-PDF Reader")
+        self.setWindowTitle("Pyxis — PDF Reader")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #121212; color: #eeeeee;")
         self._build_toolbar()

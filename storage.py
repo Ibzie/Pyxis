@@ -6,18 +6,18 @@ from datetime import datetime
 
 
 def app_data_dir():
-    """OS-specific writable data directory for AI-PDF.
+    """OS-specific writable data directory for Pyxis.
 
-    Linux:  ~/.local/share/ai-pdf/
-    macOS:  ~/Library/Application Support/ai-pdf/
-    Windows: %APPDATA%\\ai-pdf\\
+    Linux:  ~/.local/share/pyxis/
+    macOS:  ~/Library/Application Support/pyxis/
+    Windows: %APPDATA%\\pyxis\\
     """
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "ai-pdf"
+        return Path.home() / "Library" / "Application Support" / "pyxis"
     elif sys.platform == "win32":
-        return Path(os.environ.get("APPDATA", Path.home())) / "ai-pdf"
+        return Path(os.environ.get("APPDATA", Path.home())) / "pyxis"
     else:
-        return Path.home() / ".local" / "share" / "ai-pdf"
+        return Path.home() / ".local" / "share" / "pyxis"
 
 
 class PdfStorage:

@@ -9,12 +9,6 @@ set -euo pipefail
 #   - GitHub CLI (gh) installed and authenticated: gh auth login
 #   - Build artifacts in dist/ (run build_linux.sh / build_windows.bat first)
 #   - All changes committed and pushed to main
-#
-# What it does:
-#   1. Creates a git tag (v1.0.0)
-#   2. Creates a GitHub Release attached to that tag
-#   3. Uploads dist/*.AppImage and dist/*.exe as release assets
-#   4. Users download from: https://github.com/<user>/<repo>/releases
 
 VERSION="${1:-1.0.0}"
 TAG="v${VERSION}"
@@ -54,12 +48,12 @@ else
 fi
 
 # Create release + upload assets
-RELEASE_NOTES="## AI-PDF v${VERSION}
+RELEASE_NOTES="## Pyxis v${VERSION}
 
 ### Downloads
-- **Linux**: \`AI-PDF-${VERSION}-x86_64.AppImage\` — single file, no install needed
-  - \`chmod +x AI-PDF-${VERSION}-x86_64.AppImage && ./AI-PDF-${VERSION}-x86_64.AppImage\`
-- **Windows**: \`AI-PDF.exe\` — single portable executable, no install needed
+- **Linux**: \`Pyxis-${VERSION}-x86_64.AppImage\` — single file, no install needed
+  - \`chmod +x Pyxis-${VERSION}-x86_64.AppImage && ./Pyxis-${VERSION}-x86_64.AppImage\`
+- **Windows**: \`Pyxis.exe\` — single portable executable, no install needed
   - Double-click to run
 
 ### Features
@@ -76,7 +70,7 @@ If you have an NVIDIA GPU, it auto-downloads the CUDA build for faster AI.
 "
 
 gh release create "$TAG" \
-    --title "AI-PDF v${VERSION}" \
+    --title "Pyxis v${VERSION}" \
     --notes "$RELEASE_NOTES" \
     --latest
 
@@ -93,6 +87,3 @@ echo ""
 echo "=== Release created ==="
 REPO_URL=$(gh repo view --json url -q .url)
 echo "  Download: ${REPO_URL}/releases/tag/${TAG}"
-echo ""
-echo "  Users can download the AppImage/exe directly from that page —"
-echo "  no git clone needed."

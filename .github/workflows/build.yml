@@ -59,7 +59,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: dist/AI-PDF.exe
+          path: dist/Pyxis.exe
           if-no-files-found: error
 
   release:
@@ -89,4 +89,4 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.AppImage
-            dist/AI-PDF.exe
+            dist/Pyxis.exe

@@ -1,4 +1,4 @@
-# AI-PDF Packaging
+# Pyxis Packaging
 
 Build scripts for Linux (AppImage) and Windows (portable EXE).
 
@@ -10,11 +10,11 @@ Build scripts for Linux (AppImage) and Windows (portable EXE).
 pip install -r requirements.txt
 pip install pyinstaller
 ./packaging/build_linux.sh
-# → dist/AI-PDF-1.0.0-x86_64.AppImage
+# → dist/Pyxis-1.0.0-x86_64.AppImage
 ```
-Run: `chmod +x dist/AI-PDF-*.AppImage && ./dist/AI-PDF-*.AppImage`
+Run: `chmod +x dist/Pyxis-*.AppImage && ./dist/Pyxis-*.AppImage`
 
-Install (optional): `mv dist/AI-PDF-*.AppImage ~/.local/bin/ai-pdf`
+Install (optional): `mv dist/Pyxis-*.AppImage ~/.local/bin/pyxis`
 
 The AppImage is a single self-contained executable — no installation,
 no root permissions, no dependencies. It mounts via FUSE and runs.
@@ -24,9 +24,9 @@ no root permissions, no dependencies. It mounts via FUSE and runs.
 pip install -r requirements.txt
 pip install pyinstaller
 packaging\build_windows.bat
-:: → dist\AI-PDF.exe
+:: → dist\Pyxis.exe
 ```
-Run: Double-click `AI-PDF.exe`. No installation needed — it's a single
+Run: Double-click `Pyxis.exe`. No installation needed — it's a single
 portable executable. Copy it to any folder (Desktop, Program Files, USB).
 
 ## GPU acceleration
@@ -42,8 +42,8 @@ AI inference uses the GPU automatically.
 The app stores all user data in OS-specific locations:
 | Platform | Path |
 |---|---|
-| Linux | `~/.local/share/ai-pdf/` |
-| Windows | `%APPDATA%\ai-pdf\` |
+| Linux | `~/.local/share/pyxis/` |
+| Windows | `%APPDATA%\pyxis\` |
 
 Subdirectories:
 - `notes/<pdf-name>/` — per-PDF notes, highlights, captures, annotations
@@ -54,15 +54,15 @@ Subdirectories:
 
 ## App icon
 
-Source: `packaging/icons/ai-pdf.svg`
-- `ai-pdf.png` (256×256) — used by AppImage
-- `ai-pdf.ico` (multi-res) — embedded in Windows exe
+Source: `packaging/icons/pyxis.svg`
+- `pyxis.png` (256×256) — used by AppImage
+- `pyxis.ico` (multi-res) — embedded in Windows exe
 
 ## How the build works
 
 1. **PyInstaller** bundles the Python app + all deps into either:
-   - `dist/AI-PDF/` (onedir — for AppImage)
-   - `dist/AI-PDF.exe` (onefile — for Windows)
+   - `dist/Pyxis/` (onedir — for AppImage)
+   - `dist/Pyxis.exe` (onefile — for Windows)
 2. **Qt6 trimming**: The spec filters out ~400 MB of unused Qt6 modules
    (WebEngine, QML, 3D, Multimedia, SQL, etc.) by removing them from
    the binary list before packaging.
@@ -82,7 +82,7 @@ Source: `packaging/icons/ai-pdf.svg`
 ## CUDA library hosting
 
 The CUDA `libllama` binaries are hosted as HuggingFace assets in the
-`ai-pdf/native-libs` repo. To build and upload:
+`pyxis/native-libs` repo. To build and upload:
 
 ```sh
 # Linux CUDA build

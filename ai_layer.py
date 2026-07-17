@@ -146,7 +146,7 @@ def ensure_gpu_native(on_status=None):
         # Host the CUDA libs in a dedicated HF repo (or GitHub releases).
         # Using HF keeps the download path consistent with model downloads.
         downloaded = hf_hub_download(
-            repo_id="ai-pdf/native-libs",
+            repo_id="pyxis/native-libs",
             filename=asset_name,
             cache_dir=str(native_dir.parent / "native-cache"),
         )
