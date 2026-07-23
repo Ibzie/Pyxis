@@ -14,13 +14,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 echo "=== Pyxis Linux AppImage Build ==="
 
+# ── Pick a Python interpreter ──────────────────────────────────────────────
+# Prefer a local venv, fall back to the system python (CI environments).
+if [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+else
+    PY="python"
+fi
+echo "  Using interpreter: $PY ($($PY --version 2>&1))"
+
 # Clean previous builds
 rm -rf build/ dist/Pyxis/ dist/AppDir/ dist/Pyxis-*.AppImage
 mkdir -p dist
 
 # ── Step 1: PyInstaller onedir build ──────────────────────────────────────
 echo "--- Running PyInstaller (onedir)..."
-.venv/bin/python -m PyInstaller packaging/pyxis.spec --noconfirm --clean
+"$PY" -m PyInstaller packaging/pyxis.spec --noconfirm --clean
 
 if [ ! -d "dist/Pyxis" ]; then
     echo "ERROR: dist/Pyxis/ not created — PyInstaller build failed"
