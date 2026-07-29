@@ -22,6 +22,7 @@ class NarratorWorker(QThread):
     Signals:
         page_started(int)               — page narration began
         chunk_queued(str)               — a text chunk was enqueued to TTS
+        chunk_progress(int, int)        — (page_idx, chunk_index) before each chunk
         caption_ready(str, str)         — (description, image_md) ready for notes
         page_done(int)                  — all chunks processed (speech may still play)
         failed(str)                     — error
@@ -29,6 +30,7 @@ class NarratorWorker(QThread):
 
     page_started = pyqtSignal(int)
     chunk_queued = pyqtSignal(str)
+    chunk_progress = pyqtSignal(int, int)
     caption_ready = pyqtSignal(str, str)
     page_done = pyqtSignal(int)
     failed = pyqtSignal(str)
@@ -41,11 +43,14 @@ class NarratorWorker(QThread):
         self.storage = storage
         self.speech = speech_queue
         self._page_idx = None
+        self._start_chunk = 0
         self._running = True
 
-    def read_page(self, page_idx):
-        """Queue a page for narration. Call from the UI thread."""
+    def read_page(self, page_idx, start_chunk=0):
+        """Queue a page for narration, optionally skipping the first
+        `start_chunk` chunks (used by the cross-session resume command)."""
         self._page_idx = page_idx
+        self._start_chunk = start_chunk
         if not self.isRunning():
             self.start()
 
@@ -57,32 +62,43 @@ class NarratorWorker(QThread):
         if self._page_idx is None:
             return
         idx = self._page_idx
+        start = self._start_chunk
         self._page_idx = None
+        self._start_chunk = 0
         try:
-            self._narrate_page(idx)
+            self._narrate_page(idx, start)
         except Exception as e:
             log.exception("narrator error on page %d", idx)
             self.failed.emit(str(e))
 
-    def _narrate_page(self, page_idx):
+    def _narrate_page(self, page_idx, start_chunk=0):
         self.page_started.emit(page_idx)
-        log.info("narrating page %d", page_idx)
+        log.info("narrating page %d (from chunk %d)", page_idx, start_chunk)
 
         # Gather chunks for this page in source order.
         chunks = [c for c in self.rag.chunks if c["page"] == page_idx]
+        if start_chunk > 0 and chunks:
+            chunks = chunks[start_chunk:]
         if not chunks:
-            # No RAG chunks — read raw page text as fallback.
-            doc = fitz.open(self.engine.path)
-            text = doc.load_page(page_idx).get_text()
-            doc.close()
-            if text.strip():
-                self.speech.enqueue(text)
-                self.chunk_queued.emit(text[:80])
+            # No RAG chunks (or we skipped them all) — read raw page text as
+            # fallback, but only when starting from the top.
+            if start_chunk == 0:
+                doc = fitz.open(self.engine.path)
+                text = doc.load_page(page_idx).get_text()
+                doc.close()
+                if text.strip():
+                    self.chunk_progress.emit(page_idx, 0)
+                    self.speech.enqueue(text)
+                    self.chunk_queued.emit(text[:80])
         else:
             doc = fitz.open(self.engine.path)
-            for c in chunks:
+            for i, c in enumerate(chunks):
                 if not self._running:
                     break
+                # Absolute chunk index (relative to the page's full chunk list)
+                # so the UI can persist a stable resume point.
+                abs_idx = start_chunk + i
+                self.chunk_progress.emit(page_idx, abs_idx)
                 if c["type"] == "image":
                     self._describe_and_enqueue(doc, page_idx, c)
                 else:

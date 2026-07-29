@@ -37,15 +37,23 @@ Single-binary Python app: a native GUI PDF reader with integrated Markdown notes
   - Piper TTS engine downloads a ~65 MB voice file on first run (`~/.local/share/pyxis/voices/`).
   - `NarratorWorker` reads pages aloud: paragraph/table text → TTS; image chunks → Gemma 4 vision model → caption appended to notes + spoken.
   - Image descriptions are cached in `annotations.json["image_descriptions"]` so re-opening a PDF skips re-running the model.
+  - A secondary accessibility toolbar appears below the main one with **Speed** (0.5×–2.0×) and **Volume** (0–100%) sliders plus Pause/Stop/Continue/Help buttons. Slider changes are pushed live to the TTS engine (`PiperEngine` uses Piper's `SynthesisConfig(length_scale, volume)`; falls back to int16 scaling + no-op rate when `SynthesisConfig` isn't importable).
+  - Pause/resume is **sentence-grained**: `SpeechQueue.pause()` cancels the in-flight chunk, stashes it, and `resume()` replays that sentence from the top. Resume position is persisted per-PDF in `annotations.json["narration_position"]` (`{"page", "chunk", "timestamp"}`) on every `chunk_progress` signal and on page completion, so `C` ("Continue reading") works across sessions.
 - Keyboard shortcuts (only active when a11y is on):
   - `Space`/`P` — pause/resume narration
   - `R` — read current page from start
+  - `C` — continue reading from saved position (cross-session resume)
   - `S` — stop narration and clear queue
   - `I` — describe next image on current page
   - `N` — read notes panel aloud
+  - `?` — open the Accessibility Help window and read it aloud (the keybind list lives in `A11Y_KEYBINDS` at the top of `main.py`)
   - `Esc` — stop narration (or cancel AI, or clear search — context-dependent)
   - `Alt+Left/Right` — navigate pages (stops narration first)
 - Right-clicking an image region in `PageView` triggers description immediately.
+
+## Notes PDF export
+- The `NotesPanel` "PDF" button exports `notes.md` to a PDF via `QTextDocument.print(QPrinter)`.
+- Image references (`![alt](rel/path.png)`) are resolved against the PDF's `notes/<pdf-name>/` folder and **pre-registered as `QTextDocument` image resources** before `setHtml`, so the bitmaps embed into the exported PDF instead of leaving a broken `file://` path placeholder.
 
 ## Model tiers
 Gemma 4 (auto-pick, multimodal — text + image + audio on E2B/E4B):

@@ -7,7 +7,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QMenu, QListWidget, QListWidgetItem,
-    QStatusBar, QSplitter, QInputDialog, QProgressBar, QWidgetAction
+    QStatusBar, QSplitter, QInputDialog, QProgressBar, QWidgetAction,
+    QSlider, QDialog, QTextEdit
 )
 from pdf_engine import PdfEngine, ZOOM_LEVELS
 from page_view import PageView
@@ -17,6 +18,31 @@ from ai_layer import AILayer, TIERS, detect_capacity, fit_level
 from ai_workers import LoadWorker, InferWorker, IndexWorker
 from speech import create_engine, SpeechQueue
 from narrator import NarratorWorker
+
+
+# Accessibility keybind reference — shown in the Help window and spoken
+# aloud when the user presses `?` while in accessibility mode.
+A11Y_KEYBINDS = [
+    ("Ctrl+Shift+A", "Toggle accessibility mode on/off"),
+    ("Space / P",    "Pause or resume narration"),
+    ("R",            "Read the current page from the start"),
+    ("C",            "Continue reading from your saved position"),
+    ("S",            "Stop narration and clear the queue"),
+    ("I",            "Describe the next image on the current page"),
+    ("N",            "Read the notes panel aloud"),
+    ("?",            "Open this help (and read it aloud)"),
+    ("Esc",          "Stop narration / cancel AI / clear search"),
+    ("Alt + ←/→",    "Go to the previous / next page"),
+]
+
+
+def _keybinds_text():
+    """Plain-text rendering of A11Y_KEYBINDS for the Help dialog and TTS."""
+    width = max(len(k) for k, _ in A11Y_KEYBINDS)
+    lines = ["Accessibility keyboard shortcuts:", ""]
+    for key, desc in A11Y_KEYBINDS:
+        lines.append(f"  {key.ljust(width)}   {desc}")
+    return "\n".join(lines)
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +69,10 @@ class MainWindow(QMainWindow):
         self._speech_engine = None
         self._speech_queue = None
         self._narrator = None
+        self._a11y_speed = 1.0   # multiplier
+        self._a11y_volume = 1.0  # 0.0–1.0
+        self._resume_pos = None     # last persisted (page, chunk)
+        self._a11y_help_win = None  # Help dialog (kept alive for non-modal show)
         self.setWindowTitle("Pyxis — PDF Reader")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #121212; color: #eeeeee;")
@@ -114,6 +144,61 @@ class MainWindow(QMainWindow):
         self.ai_progress_lbl.setVisible(False)
         self.toolbar.addWidget(self.ai_progress_lbl)
         self.toolbar.addWidget(self.ai_progress)
+        self._build_a11y_bar()
+
+    def _build_a11y_bar(self):
+        """Thin secondary toolbar with speed/volume/pause/continue/help.
+        Hidden until accessibility mode is toggled on."""
+        self.a11y_bar = QToolBar("Accessibility")
+        self.a11y_bar.setStyleSheet(
+            "QToolBar { background: #1a1a1a; border: none; spacing: 8px; padding: 4px; }"
+            "QLabel { color: #aaa; }"
+            "QSlider { width: 120px; }"
+            "QSlider::groove:horizontal { background: #333; height: 4px; }"
+            "QSlider::handle:horizontal { background: #4a90d9; width: 12px; "
+            "margin: -4px 0; border-radius: 6px; }"
+            "QPushButton { background: #333; color: #eee; border: none; padding: 4px 10px; }"
+            "QPushButton:hover { background: #444; }"
+            "QPushButton:checked { background: #4a90d9; color: #fff; }"
+        )
+        self.a11y_speed_lbl = QLabel("Speed: 1.0×")
+        self.a11y_speed = QSlider(Qt.Orientation.Horizontal)
+        self.a11y_speed.setRange(50, 200)
+        self.a11y_speed.setValue(100)
+        self.a11y_speed.setFixedWidth(120)
+        self.a11y_speed.setToolTip("Narration speed (0.5×–2.0×)")
+        self.a11y_speed.valueChanged.connect(self._on_a11y_speed)
+        self.a11y_vol_lbl = QLabel("Volume: 100%")
+        self.a11y_volume = QSlider(Qt.Orientation.Horizontal)
+        self.a11y_volume.setRange(0, 100)
+        self.a11y_volume.setValue(100)
+        self.a11y_volume.setFixedWidth(120)
+        self.a11y_volume.setToolTip("Narration volume (0–100%)")
+        self.a11y_volume.valueChanged.connect(self._on_a11y_volume)
+        self.a11y_play_btn = QPushButton("⏸ Pause", checkable=True)
+        self.a11y_play_btn.clicked.connect(self._on_a11y_play_toggled)
+        self.a11y_stop_btn = QPushButton("⏹ Stop")
+        self.a11y_stop_btn.clicked.connect(self._stop_narration)
+        self.a11y_continue_btn = QPushButton("⏭ Continue")
+        self.a11y_continue_btn.clicked.connect(self._continue_reading)
+        self.a11y_help_btn = QPushButton("? Help")
+        self.a11y_help_btn.clicked.connect(self._show_a11y_help)
+        self.a11y_bar.addWidget(QLabel("🎧"))
+        self.a11y_bar.addWidget(QLabel("Speed:"))
+        self.a11y_bar.addWidget(self.a11y_speed)
+        self.a11y_bar.addWidget(self.a11y_speed_lbl)
+        self.a11y_bar.addSeparator()
+        self.a11y_bar.addWidget(QLabel("Volume:"))
+        self.a11y_bar.addWidget(self.a11y_volume)
+        self.a11y_bar.addWidget(self.a11y_vol_lbl)
+        self.a11y_bar.addSeparator()
+        self.a11y_bar.addWidget(self.a11y_play_btn)
+        self.a11y_bar.addWidget(self.a11y_stop_btn)
+        self.a11y_bar.addWidget(self.a11y_continue_btn)
+        self.a11y_bar.addWidget(self.a11y_help_btn)
+        self.addToolBarBreak()  # second toolbar row below the main one
+        self.addToolBar(self.a11y_bar)
+        self.a11y_bar.setVisible(False)
 
     def _build_sidebar(self):
         self.sidebar = QFrame()
@@ -640,6 +725,15 @@ class MainWindow(QMainWindow):
 
     def _a11y_on(self):
         self._a11y_mode = True
+        self.a11y_bar.setVisible(True)
+        # Restore slider values to the new engine.
+        self._on_a11y_speed(self.a11y_speed.value(), quiet=True)
+        self._on_a11y_volume(self.a11y_volume.value(), quiet=True)
+        # Load any saved resume position for this PDF.
+        if self.storage:
+            pos = self.storage.get_narration_position()
+            if pos is not None:
+                self._resume_pos = (pos.get("page", 0), pos.get("chunk", 0))
         self.status.showMessage("Accessibility: starting TTS engine…")
         def on_tts_status(m):
             self.status.showMessage(f"TTS: {m}")
@@ -648,21 +742,23 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.status.showMessage(f"TTS unavailable: {e}")
             self._a11y_mode = False
+            self.a11y_bar.setVisible(False)
             return
+        # Push current slider settings to the freshly-loaded engine.
+        self._speech_engine.set_rate(self._a11y_speed)
+        if hasattr(self._speech_engine, "set_volume"):
+            self._speech_engine.set_volume(self._a11y_volume)
         self._speech_queue = SpeechQueue(self._speech_engine, self)
         self._speech_queue.chunk_started.connect(
             lambda t: self.status.showMessage(f"🔊 {t[:60]}"))
         self._speech_queue.start()
-        if self.ai.is_loaded():
-            self._narrator = NarratorWorker(
-                self.engine, self.rag_index, self.ai, self.storage,
-                self._speech_queue, self)
-            self._narrator.caption_ready.connect(self._on_caption_ready)
-            self._narrator.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
-        self.status.showMessage("Accessibility mode on — press R to read page, I to describe image")
+        # NarratorWorker is created lazily by self._narrator() on first read,
+        # so we always bind the current rag_index and storage.
+        self.status.showMessage("Accessibility mode on — press R to read, C to continue, ? for help")
 
     def _a11y_off(self):
         self._a11y_mode = False
+        self.a11y_bar.setVisible(False)
         if self._narrator:
             self._narrator.cancel()
             self._narrator = None
@@ -674,8 +770,21 @@ class MainWindow(QMainWindow):
             self._speech_engine = None
         self.status.showMessage("Accessibility mode off")
 
+    def _narrator(self):
+        """Lazily create a NarratorWorker, reusing it across reads so the
+        cross-session resume pointer stays consistent."""
+        if self._narrator is None or not self._narrator.isRunning():
+            self._narrator = NarratorWorker(
+                self.engine, self.rag_index, self.ai, self.storage,
+                self._speech_queue, self)
+            self._narrator.caption_ready.connect(self._on_caption_ready)
+            self._narrator.chunk_progress.connect(self._on_narrator_chunk_progress)
+            self._narrator.page_done.connect(self._on_narrator_page_done)
+            self._narrator.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
+        return self._narrator
+
     def _read_current_page(self):
-        """Read the current page aloud via the narrator."""
+        """Read the current page aloud via the narrator, from the top."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
         if not self.ai.is_loaded():
@@ -684,28 +793,102 @@ class MainWindow(QMainWindow):
         if not self.rag_index or not self.rag_index.is_ready:
             self.status.showMessage("Indexing in progress — wait for index ready")
             return
-        if self._narrator is None or not self._narrator.isRunning():
-            self._narrator = NarratorWorker(
-                self.engine, self.rag_index, self.ai, self.storage,
-                self._speech_queue, self)
-            self._narrator.caption_ready.connect(self._on_caption_ready)
-            self._narrator.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
-        self._narrator.read_page(self.current_page)
+        # Starting fresh from the top — reset the pause button label.
+        self.a11y_play_btn.setChecked(False)
+        self.a11y_play_btn.setText("⏸ Pause")
+        self._narrator().read_page(self.current_page, start_chunk=0)
         self.status.showMessage(f"Reading page {self.current_page + 1}…")
 
+    def _continue_reading(self):
+        """Resume narration from the last-saved position (cross-session safe)."""
+        if not self._a11y_mode:
+            self.toggle_a11y(True)
+        if not self.ai.is_loaded():
+            self.status.showMessage("Load an AI model first (AI menu)")
+            return
+        if not self.rag_index or not self.rag_index.is_ready:
+            self.status.showMessage("Indexing in progress — wait for index ready")
+            return
+        page, chunk = self._resume_pos or (self.current_page, 0)
+        if self.engine.doc and 0 <= page < self.engine.page_count:
+            self.go_to_page(page)
+            self.a11y_play_btn.setChecked(False)
+            self.a11y_play_btn.setText("⏸ Pause")
+            self._narrator().read_page(page, start_chunk=chunk)
+            self.status.showMessage(
+                f"Continuing from page {page + 1}, chunk {chunk}…")
+        else:
+            # Saved position no longer valid — fall back to current page.
+            self._narrator().read_page(self.current_page, start_chunk=0)
+            self.status.showMessage(f"Reading page {self.current_page + 1}…")
+
     def _pause_narration(self):
-        """Pause/resume TTS playback."""
-        if self._speech_queue and self._speech_queue.isRunning():
-            if self._speech_engine and self._speech_engine.is_speaking():
-                self._speech_engine.cancel()
-                self.status.showMessage("Narration paused")
-            else:
-                self.status.showMessage("Narration resumed")
+        """Toggle pause/resume on the speech queue (sentence-grained)."""
+        if not self._speech_queue:
+            return
+        if self._speech_queue.is_paused():
+            self._speech_queue.resume()
+            self.a11y_play_btn.setChecked(False)
+            self.a11y_play_btn.setText("⏸ Pause")
+            self.status.showMessage("Narration resumed")
+        else:
+            self._speech_queue.pause()
+            self.a11y_play_btn.setChecked(True)
+            self.a11y_play_btn.setText("▶ Resume")
+            self.status.showMessage("Narration paused")
+
+    def _on_a11y_play_toggled(self, checked):
+        """Mirror the toolbar Pause/Resume button into the queue."""
+        if not self._speech_queue:
+            return
+        if checked:
+            self._speech_queue.pause()
+            self.a11y_play_btn.setText("▶ Resume")
+            self.status.showMessage("Narration paused")
+        else:
+            self._speech_queue.resume()
+            self.a11y_play_btn.setText("⏸ Pause")
+            self.status.showMessage("Narration resumed")
+
+    def _on_a11y_speed(self, value, quiet=False):
+        """Speed slider: value is 50–200 → 0.5×–2.0×."""
+        self._a11y_speed = value / 100.0
+        self.a11y_speed_lbl.setText(f"Speed: {self._a11y_speed:.1f}×")
+        if self._speech_queue:
+            self._speech_queue.set_rate(self._a11y_speed)
+        if not quiet:
+            self.status.showMessage(f"Narration speed: {self._a11y_speed:.1f}×")
+
+    def _on_a11y_volume(self, value, quiet=False):
+        """Volume slider: value is 0–100 → 0.0–1.0."""
+        self._a11y_volume = value / 100.0
+        self.a11y_vol_lbl.setText(f"Volume: {value}%")
+        if self._speech_queue:
+            self._speech_queue.set_volume(self._a11y_volume)
+        if not quiet:
+            self.status.showMessage(f"Narration volume: {value}%")
+
+    def _on_narrator_chunk_progress(self, page, chunk):
+        """Persist the live narration position so 'Continue reading' works
+        across sessions and after a manual stop."""
+        if self.storage:
+            self._resume_pos = (page, chunk)
+            self.storage.save_narration_position(page, chunk)
+
+    def _on_narrator_page_done(self, page):
+        """When a page finishes naturally, advance the resume pointer to
+        the top of the next page so 'Continue' doesn't replay this one."""
+        if self.storage and self.engine.doc:
+            nxt = min(page + 1, self.engine.page_count - 1)
+            self._resume_pos = (nxt, 0)
+            self.storage.save_narration_position(nxt, 0)
 
     def _stop_narration(self):
         """Stop all narration and clear the TTS queue."""
         if self._speech_queue:
             self._speech_queue.cancel()
+        self.a11y_play_btn.setChecked(False)
+        self.a11y_play_btn.setText("⏸ Pause")
         self.status.showMessage("Narration stopped")
 
     def _describe_next_image(self):
@@ -782,6 +965,48 @@ class MainWindow(QMainWindow):
             self._speech_queue.enqueue(text)
             self.status.showMessage("Reading notes…")
 
+    def _show_a11y_help(self):
+        """Open the Accessibility Help window and read it aloud."""
+        if not self._a11y_mode:
+            self.toggle_a11y(True)
+        dlg = self._a11y_help_win
+        if dlg is None or not dlg.isVisible():
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Pyxis — Accessibility Help")
+            dlg.setMinimumWidth(420)
+            layout = QVBoxLayout(dlg)
+            layout.setContentsMargins(16, 16, 16, 16)
+            head = QLabel("🎧 Accessibility — keyboard shortcuts")
+            head.setStyleSheet("font-size: 15px; font-weight: bold; color: #4a90d9;")
+            layout.addWidget(head)
+            body = QTextEdit()
+            body.setReadOnly(True)
+            body.setStyleSheet(
+                "QTextEdit { background-color: #1a1a1a; color: #ddd; "
+                "border: none; font-family: monospace; font-size: 13px; }")
+            body.setPlainText(_keybinds_text())
+            body.setFixedHeight(220)
+            layout.addWidget(body)
+            tip = QLabel(
+                "Tip: use the toolbar sliders for speed & volume, "
+                "or press ? any time to hear this list again.")
+            tip.setWordWrap(True)
+            tip.setStyleSheet("color: #aaa; padding-top: 8px;")
+            layout.addWidget(tip)
+            close = QPushButton("Close")
+            close.clicked.connect(dlg.close)
+            layout.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
+            dlg.show()
+            self._a11y_help_win = dlg
+        else:
+            dlg.raise_()
+            dlg.activateWindow()
+        # Read it aloud too.
+        if self._speech_queue:
+            self._speech_queue.cancel()
+            self._speech_queue.enqueue(_keybinds_text())
+        self.status.showMessage("Accessibility help")
+
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
             if self.capture_mode:
@@ -802,6 +1027,9 @@ class MainWindow(QMainWindow):
             elif k == Qt.Key.Key_R:
                 self._read_current_page()
                 return
+            elif k == Qt.Key.Key_C:
+                self._continue_reading()
+                return
             elif k == Qt.Key.Key_S:
                 self._stop_narration()
                 return
@@ -811,6 +1039,12 @@ class MainWindow(QMainWindow):
             elif k == Qt.Key.Key_N:
                 self._read_notes_aloud()
                 return
+        # `?` needs Shift on most layouts, so handle it separately.
+        if (self._a11y_mode and event.key() == Qt.Key.Key_Question
+                and event.modifiers() in (Qt.KeyboardModifier.NoModifier,
+                                           Qt.KeyboardModifier.ShiftModifier)):
+            self._show_a11y_help()
+            return
         if event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
             if event.key() == Qt.Key.Key_A:
                 self.toggle_a11y()

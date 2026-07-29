@@ -140,3 +140,22 @@ class PdfStorage:
             entry["file"] = str(Path(img_path).relative_to(self.folder))
         self.annotations.setdefault("image_descriptions", {})[key] = entry
         self._save_json(self.annotations_file, self.annotations)
+
+    # ── narration resume position (accessibility) ──────────────────────────
+    def get_narration_position(self):
+        """Return the last-saved narration position, or None.
+
+        Shape: {"page": int, "chunk": int, "timestamp": str}
+        """
+        return self.annotations.get("narration_position")
+
+    def save_narration_position(self, page, chunk):
+        """Persist the current narration position so the user can resume
+        after closing/reopening the PDF. `chunk` is an index into the
+        page's RAG chunk list (0 = start of page)."""
+        self.annotations["narration_position"] = {
+            "page": int(page),
+            "chunk": int(chunk),
+            "timestamp": self._now_iso(),
+        }
+        self._save_json(self.annotations_file, self.annotations)

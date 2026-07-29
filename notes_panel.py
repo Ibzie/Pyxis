@@ -363,6 +363,28 @@ class NotesPanel(QWidget):
         if not path:
             return
         doc = QTextDocument()
+        # Pre-register every referenced image as a QTextDocument resource so
+        # setHtml can render them inline. Without this, <img src="file://…">
+        # tags produce a broken-path stub in the exported PDF (the image path
+        # was printed instead of the bitmap).
+        if self._base_dir:
+            for m in re.finditer(r'!\[([^\]]*)\]\(([^)]+)\)', self._source):
+                p = m.group(2)
+                if p.startswith(("http", "file:")):
+                    continue
+                resolved = (self._base_dir / p).resolve()
+                if not resolved.exists():
+                    continue
+                pix = QPixmap(str(resolved))
+                if pix.isNull():
+                    continue
+                max_w = 480
+                if pix.width() > max_w:
+                    pix = pix.scaledToWidth(
+                        max_w, Qt.TransformationMode.SmoothTransformation)
+                doc.addResource(
+                    QTextDocument.ResourceType.ImageResource,
+                    QUrl(resolved.as_uri()), pix)
         doc.setHtml(render_markdown_html(self._resolve(self._source)))
         printer = QPrinter()
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
