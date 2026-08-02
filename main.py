@@ -536,10 +536,15 @@ class MainWindow(QMainWindow):
             if fam != last_family:
                 if last_family is not None:
                     menu.addSeparator()
-                label = QAction(f"── {fam} {'(multimodal)' if tier.get('multimodal') else '(text only)'} ──", menu)
-                label.setEnabled(False)
-                label.setStyleSheet("QAction { color: #888; }")
-                menu.addAction(label)
+                label = QLabel(
+                    f"── {fam} {'(multimodal)' if tier.get('multimodal') else '(text only)'} ──")
+                label.setStyleSheet(
+                    "color: #888; padding: 6px 16px 2px 16px; "
+                    "font-family: monospace; font-size: 12px; background: transparent;")
+                wa = QWidgetAction(menu)
+                wa.setDefaultWidget(label)
+                wa.setEnabled(False)
+                menu.addAction(wa)
                 last_family = fam
             fit, color = fit_level(tier["footprint"], ram)
             mm = " 📷" if tier.get("multimodal") else ""
