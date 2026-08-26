@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyxis"
+version = "1.0.0"
+description = "Local-first PDF reader with multimodal AI (Gemma 4), Markdown notes, and accessibility for blind users."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Pyxis" }]
+keywords = ["pdf", "ai", "gemma", "tts", "accessibility", "markdown", "rag", "local-first"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Office/Business",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = [
+    "PyQt6>=6.6",
+    "PyMuPDF>=1.23",
+    "llama-cpp-python>=0.3",
+    "huggingface_hub>=0.20",
+    "psutil>=5.9",
+    "markdown-it-py>=3.0",
+    "mdit-py-plugins>=0.4",
+    "linkify-it-py>=2.0",
+    "rank-bm25>=0.2",
+    "rapidfuzz>=3.0",
+    "piper-tts>=1.0",
+    "sounddevice>=0.4",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pyinstaller>=6.0"]
+gpu = []  # llama-cpp-python CUDA build is a manual step; see README
+
+[project.scripts]
+pyxis = "pyxis.main:main"
+
+[project.urls]
+Homepage = "https://github.com/Ibzie/Pyxis"
+Issues = "https://github.com/Ibzie/Pyxis/issues"
+
+[tool.setuptools]
+packages = ["pyxis"]
+
+[tool.setuptools.package-dir]
+pyxis = "src/pyxis"

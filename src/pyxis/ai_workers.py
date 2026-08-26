@@ -1,5 +1,5 @@
 from PyQt6.QtCore import QThread, pyqtSignal
-from ai_layer import AILayer
+from .ai_layer import AILayer
 
 
 class LoadWorker(QThread):
@@ -40,7 +40,7 @@ class IndexWorker(QThread):
     def run(self):
         try:
             import fitz
-            from rag import RagIndex
+            from .rag import RagIndex
             doc = fitz.open(self.engine.path)
             rag = RagIndex()
             total = doc.page_count

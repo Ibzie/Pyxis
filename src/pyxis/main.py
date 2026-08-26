@@ -1,4 +1,4 @@
-import sys, json, os, logging, logging.handlers
+import sys, json, os, logging, logging.handlers, threading
 from datetime import datetime
 from pathlib import Path
 from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal
@@ -10,14 +10,14 @@ from PyQt6.QtWidgets import (
     QStatusBar, QSplitter, QInputDialog, QProgressBar, QWidgetAction,
     QSlider, QDialog, QTextEdit
 )
-from pdf_engine import PdfEngine, ZOOM_LEVELS
-from page_view import PageView
-from notes_panel import NotesPanel
-from storage import PdfStorage
-from ai_layer import AILayer, TIERS, detect_capacity, fit_level
-from ai_workers import LoadWorker, InferWorker, IndexWorker
-from speech import create_engine, SpeechQueue
-from narrator import NarratorWorker
+from .pdf_engine import PdfEngine, ZOOM_LEVELS
+from .page_view import PageView
+from .notes_panel import NotesPanel
+from .storage import PdfStorage
+from .ai_layer import AILayer, TIERS, detect_capacity, fit_level
+from .ai_workers import LoadWorker, InferWorker, IndexWorker
+from .speech import SpeechQueue, VoiceLoadWorker
+from .narrator import NarratorWorker
 
 
 # Accessibility keybind reference — shown in the Help window and spoken
@@ -68,7 +68,8 @@ class MainWindow(QMainWindow):
         self._a11y_mode = False
         self._speech_engine = None
         self._speech_queue = None
-        self._narrator = None
+        self._voice_loader = None      # A9: background Piper voice download
+        self._narrator_worker = None
         self._a11y_speed = 1.0   # multiplier
         self._a11y_volume = 1.0  # 0.0–1.0
         self._resume_pos = None     # last persisted (page, chunk)
@@ -282,10 +283,15 @@ class MainWindow(QMainWindow):
     def load_pdf(self, path):
         try:
             self.engine.open(path)
+            # PdfStorage does an unguarded mkdir here; an unwritable data
+            # dir would otherwise raise PermissionError and (with no global
+            # handler) SIGABRT the whole process.
+            self.storage = PdfStorage(path)
+            self.notes_panel.set_text(self.storage.load_notes())
+            self.notes_panel.set_base_dir(self.storage.folder)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{e}")
             return
-        self.storage = PdfStorage(path)
         self.current_page = 0
         self.zoom_index = 5
         self.zoom_level = 1.0
@@ -294,8 +300,6 @@ class MainWindow(QMainWindow):
         self.search_index = 0
         self.search_box.clear()
         self.search_info.setText("")
-        self.notes_panel.set_text(self.storage.load_notes())
-        self.notes_panel.set_base_dir(self.storage.folder)
         self._populate_bookmarks()
         self._update_info()
         self._rebuild_pages()
@@ -341,6 +345,10 @@ class MainWindow(QMainWindow):
         self._apply_zoom()
 
     def _apply_zoom(self):
+        # No document loaded yet (e.g. Ctrl+0 pressed on the welcome
+        # screen) — page_sizes is empty, so indexing it would SIGABRT.
+        if not self.engine.doc or not self.engine.page_sizes or not self.pages:
+            return
         if self.fit_width:
             self.zoom_level = (self.scroll.viewport().width() - 60) / self.engine.page_sizes[0][0]
             self.zoom_label.setText("Fit Width")
@@ -731,7 +739,7 @@ class MainWindow(QMainWindow):
     def _a11y_on(self):
         self._a11y_mode = True
         self.a11y_bar.setVisible(True)
-        # Restore slider values to the new engine.
+        # Restore slider values to the new engine (applied once it's ready).
         self._on_a11y_speed(self.a11y_speed.value(), quiet=True)
         self._on_a11y_volume(self.a11y_volume.value(), quiet=True)
         # Load any saved resume position for this PDF.
@@ -739,16 +747,33 @@ class MainWindow(QMainWindow):
             pos = self.storage.get_narration_position()
             if pos is not None:
                 self._resume_pos = (pos.get("page", 0), pos.get("chunk", 0))
-        self.status.showMessage("Accessibility: starting TTS engine…")
-        def on_tts_status(m):
-            self.status.showMessage(f"TTS: {m}")
-        try:
-            self._speech_engine = create_engine(on_status=on_tts_status)
-        except Exception as e:
-            self.status.showMessage(f"TTS unavailable: {e}")
-            self._a11y_mode = False
-            self.a11y_bar.setVisible(False)
+        # A9: the Piper voice download (~65 MB on first run) blocks for tens
+        # of seconds — run it on a QThread so the GUI stays responsive. If a
+        # download is already in flight (e.g. a quick off→on toggle), let it
+        # finish and bind via _on_voice_ready instead of spawning a second one.
+        if self._voice_loader is not None and self._voice_loader.isRunning():
+            self.status.showMessage("Accessibility: TTS voice still loading…")
             return
+        self.status.showMessage("Accessibility: downloading/loading TTS voice…")
+        self._voice_loader = VoiceLoadWorker(self)
+        self._voice_loader.status.connect(self._on_voice_status)
+        self._voice_loader.done.connect(self._on_voice_ready)
+        self._voice_loader.failed.connect(self._on_voice_failed)
+        self._voice_loader.start()
+
+    def _on_voice_status(self, msg):
+        self.status.showMessage(f"TTS: {msg}")
+
+    def _on_voice_ready(self, engine):
+        # User may have toggled a11y off (or quit) while we were loading —
+        # discard the engine instead of binding it.
+        if not self._a11y_mode:
+            try:
+                engine.shutdown()
+            except Exception:
+                pass
+            return
+        self._speech_engine = engine
         # Push current slider settings to the freshly-loaded engine.
         self._speech_engine.set_rate(self._a11y_speed)
         if hasattr(self._speech_engine, "set_volume"):
@@ -757,16 +782,22 @@ class MainWindow(QMainWindow):
         self._speech_queue.chunk_started.connect(
             lambda t: self.status.showMessage(f"🔊 {t[:60]}"))
         self._speech_queue.start()
-        # NarratorWorker is created lazily by self._narrator() on first read,
-        # so we always bind the current rag_index and storage.
-        self.status.showMessage("Accessibility mode on — press R to read, C to continue, ? for help")
+        self._voice_loader = None
+        self.status.showMessage(
+            "Accessibility mode on — press R to read, C to continue, ? for help")
+
+    def _on_voice_failed(self, msg):
+        self._voice_loader = None
+        self.status.showMessage(f"TTS unavailable: {msg}")
+        self._a11y_mode = False
+        self.a11y_bar.setVisible(False)
 
     def _a11y_off(self):
         self._a11y_mode = False
         self.a11y_bar.setVisible(False)
-        if self._narrator:
-            self._narrator.cancel()
-            self._narrator = None
+        if self._narrator_worker:
+            self._narrator_worker.cancel()
+            self._narrator_worker = None
         if self._speech_queue:
             self._speech_queue.stop()
             self._speech_queue = None
@@ -778,20 +809,23 @@ class MainWindow(QMainWindow):
     def _narrator(self):
         """Lazily create a NarratorWorker, reusing it across reads so the
         cross-session resume pointer stays consistent."""
-        if self._narrator is None or not self._narrator.isRunning():
-            self._narrator = NarratorWorker(
+        if self._narrator_worker is None or not self._narrator_worker.isRunning():
+            self._narrator_worker = NarratorWorker(
                 self.engine, self.rag_index, self.ai, self.storage,
                 self._speech_queue, self)
-            self._narrator.caption_ready.connect(self._on_caption_ready)
-            self._narrator.chunk_progress.connect(self._on_narrator_chunk_progress)
-            self._narrator.page_done.connect(self._on_narrator_page_done)
-            self._narrator.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
-        return self._narrator
+            self._narrator_worker.caption_ready.connect(self._on_caption_ready)
+            self._narrator_worker.chunk_progress.connect(self._on_narrator_chunk_progress)
+            self._narrator_worker.page_done.connect(self._on_narrator_page_done)
+            self._narrator_worker.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
+        return self._narrator_worker
 
     def _read_current_page(self):
         """Read the current page aloud via the narrator, from the top."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
+        if not self._speech_queue:
+            self.status.showMessage("TTS voice still loading…")
+            return
         if not self.ai.is_loaded():
             self.status.showMessage("Load an AI model first (AI menu)")
             return
@@ -808,6 +842,9 @@ class MainWindow(QMainWindow):
         """Resume narration from the last-saved position (cross-session safe)."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
+        if not self._speech_queue:
+            self.status.showMessage("TTS voice still loading…")
+            return
         if not self.ai.is_loaded():
             self.status.showMessage("Load an AI model first (AI menu)")
             return
@@ -965,7 +1002,10 @@ class MainWindow(QMainWindow):
         """Read the notes panel text via TTS."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
-        text = self.notes_panel.get_text()
+        if not self._speech_queue:
+            self.status.showMessage("TTS voice still loading…")
+            return
+        text = self.notes_panel.get_plain_text()
         if text.strip():
             self._speech_queue.enqueue(text)
             self.status.showMessage("Reading notes…")
@@ -1077,10 +1117,13 @@ class MainWindow(QMainWindow):
             self._apply_zoom()
 
     def closeEvent(self, event):
-        # Stop accessibility workers first (TTS + narrator).
-        if self._narrator:
-            self._narrator.cancel()
-            self._narrator.wait(3000)
+        # Stop accessibility workers first (TTS + narrator + voice loader).
+        if self._voice_loader is not None and self._voice_loader.isRunning():
+            self._a11y_mode = False  # so _on_voice_ready discards the engine
+            self._voice_loader.wait(3000)
+        if self._narrator_worker:
+            self._narrator_worker.cancel()
+            self._narrator_worker.wait(3000)
         if self._speech_queue:
             self._speech_queue.stop()
         if self._speech_engine:
@@ -1095,11 +1138,45 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _install_excephook():
+    """Install a global exception hook (F2) so an uncaught exception in any
+    Qt slot or reimplemented virtual is logged to ai.log and surfaced via
+    a modal error dialog instead of SIGABRT-ing the process (which would
+    discard unsaved notes). Exceptions on worker threads are logged only;
+    QThread workers already funnel their own errors through `failed`
+    signals, and touching the GUI from a non-main thread is illegal."""
+    log = logging.getLogger("pyxis")
+
+    def hook(exc_type, exc_value, tb):
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc_value, tb)
+            return
+        import traceback
+        text = "".join(traceback.format_exception(exc_type, exc_value, tb))
+        log.error("Unhandled exception:\n%s", text)
+        if threading.current_thread() is not threading.main_thread():
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            QMessageBox.critical(
+                None, "Pyxis — unexpected error",
+                f"An unexpected error occurred and was contained.\n"
+                f"The application will keep running, but please save your "
+                f"notes and consider restarting.\n\n{exc_value}\n\n"
+                f"Details written to ai.log.")
+        except Exception:
+            pass
+
+    sys.excepthook = hook
+
+
 def main():
     # Lean AI logging to ai.log (rotates at 1 MB, keeps 1 backup).
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-    from storage import app_data_dir
+    from .storage import app_data_dir
     log_dir = app_data_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -1108,6 +1185,7 @@ def main():
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     app = QApplication(sys.argv)
+    _install_excephook()  # F2: contain uncaught exceptions instead of SIGABRT
     app.setStyle("Fusion")
     palette = app.palette()
     palette.setColor(palette.ColorRole.Window, QColor(18, 18, 18))

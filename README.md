@@ -2,28 +2,45 @@
 
 > An all-local AI document reader suite for the ultimate learner.
 
-Pyxis is a local-first PDF reader with multimodal AI built in. It reads pages aloud via neural TTS, describes images and charts for blind users, answers questions about your documents with RAG-grounded citations, and writes WYSIWYG Markdown notes alongside every PDF. The AI model (Gemma 4), the TTS engine (Piper), and your documents all run entirely on your machine — no cloud, no API keys, no telemetry.
+Pyxis is a local-first PDF reader with multimodal AI built in. It reads
+pages aloud via neural TTS, describes images and charts for blind users,
+answers questions about your documents with RAG-grounded citations, and
+writes WYSIWYG Markdown notes alongside every PDF. The AI model (Gemma 4),
+the TTS engine (Piper), and your documents all run entirely on your
+machine — no cloud, no API keys, no telemetry.
 
 ## Features
 
 - **Native PDF rendering** via PyMuPDF (MuPDF) with LRU render cache
-- **WYSIWYG Markdown notes** — syntax markers hide visually, inline images render, auto-saves per PDF
-- **Multimodal AI (Gemma 4)** — summarize notes/pages, Q&A with RAG + page citations, extract to-dos, draft follow-ups, suggest tags. Streams output live into notes.
-- **Accessibility mode** 🎧 — Piper neural TTS reads pages aloud; vision model describes images for blind users; descriptions cached for re-opening
-- **RAG retrieval** — BM25 + fuzzy blend over paragraphs/tables/images with budget-aware context assembly
+- **Live-preview Markdown notes** — Obsidian-style: type Markdown, see it
+  rendered live; inline images render as pictures, not paths; debounced
+  atomic autosave per PDF
+- **Multimodal AI (Gemma 4)** — summarize notes/pages, Q&A with RAG +
+  page citations, extract to-dos, draft follow-ups, suggest tags.
+  Streams output live into notes.
+- **Accessibility mode** 🎧 — Piper neural TTS reads pages aloud; vision
+  model describes images for blind users; descriptions cached for
+  re-opening; resume-reading works across sessions
+- **RAG retrieval** — BM25 + fuzzy blend over paragraphs/tables/images
+  with budget-aware context assembly
 - **Highlights & captures** — saved as PNGs, embedded into notes
 - **Cross-platform** — Linux (AppImage), Windows (portable EXE)
 - **Dark theme** by default
 - **No cloud, no API keys, no telemetry**
 
-> The AI layer needs ≥ 8 GB RAM. On first use it downloads an open-weights Gemma 4 GGUF model (sized to your machine) + a ~65 MB Piper voice file. If you have an NVIDIA GPU, it auto-downloads a CUDA build for faster inference.
+> The AI layer needs ≥ 8 GB RAM. On first use it downloads an open-weights
+> Gemma 4 GGUF model (sized to your machine) + a ~65 MB Piper voice file.
+> If you have an NVIDIA GPU, it auto-downloads a CUDA build for faster
+> inference.
 
 ## Download
 
 Pre-built binaries are on the [GitHub Releases](../../releases) page:
 
-- **Linux**: `Pyxis-x86_64.AppImage` — single file, no install. `chmod +x && ./Pyxis-*.AppImage`
-- **Windows**: `Pyxis.exe` — single portable executable. Double-click to run.
+- **Linux**: `Pyxis-x86_64.AppImage` — single file, no install.
+  `chmod +x && ./Pyxis-*.AppImage`
+- **Windows**: `Pyxis.exe` — single portable executable. Double-click to
+  run.
 
 ## Build from source
 
@@ -33,9 +50,18 @@ Requires Python 3.10+.
 git clone https://github.com/Ibzie/Pyxis.git
 cd Pyxis
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
 ```
+
+Then run:
+
+```bash
+pyxis                     # welcome screen
+pyxis document.pdf        # open a PDF directly
+```
+
+(`python -m pyxis document.pdf` is equivalent.)
 
 For GPU acceleration (NVIDIA) build `llama-cpp-python` against CUDA:
 
@@ -45,22 +71,14 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install --upgrade --force-reinstall llama-cpp-py
 
 On Apple Silicon, Metal is picked up automatically from the prebuilt wheel.
 
-## Usage
-
-```bash
-# Open the welcome screen
-python main.py
-
-# Open a PDF directly
-python main.py document.pdf
-```
-
-For each opened PDF a folder is created at `~/.local/share/pyxis/notes/<pdf-name>/` (Linux) or `%APPDATA%\pyxis\notes\<pdf-name>\` (Windows) containing:
+For each opened PDF a folder is created at `~/.local/share/pyxis/notes/<pdf-name>/`
+(Linux) or `%APPDATA%\pyxis\notes\<pdf-name>\` (Windows) containing:
 
 - `notes.md` — editable Markdown notes
 - `highlights/` — image snippets of highlighted text
 - `captures/` — image snippets of screen captures
-- `annotations.json` — metadata index + cached image descriptions
+- `annotations.json` — metadata index + cached image descriptions +
+  narration resume position
 
 ### AI menu (toolbar → AI)
 
@@ -74,17 +92,24 @@ For each opened PDF a folder is created at `~/.local/share/pyxis/notes/<pdf-name
 | Draft Follow-up | A short connecting note |
 | Suggest Tags | A line of `#tag` tokens |
 
-AI output is streamed live into the notes panel and saved like any other note. `Esc` cancels an active run.
+AI output is streamed live into the notes panel and saved like any other
+note. `Esc` cancels an active run.
 
 ### Accessibility (🎧 toolbar button or Ctrl+Shift+A)
+
+See [`docs/accessibility.md`](docs/accessibility.md) for the full guide.
+Resume-reading works across sessions, and every image is described aloud
+by the on-device vision model.
 
 | Shortcut | Action |
 |----------|--------|
 | `R` | Read current page aloud (TTS) |
+| `C` | Continue reading from your saved position (cross-session) |
 | `S` | Stop narration |
 | `Space` / `P` | Pause/resume narration |
 | `I` | Describe next image on current page (vision model) |
 | `N` | Read notes panel aloud |
+| `?` | Open the Accessibility Help window (and read it aloud) |
 | `Alt+Left/Right` | Navigate pages (stops narration first) |
 
 Right-clicking an image region triggers description immediately.
@@ -95,7 +120,8 @@ Right-clicking an image region triggers description immediately.
 |----------|--------|
 | `Ctrl+O` | Open file |
 | `Ctrl+0` | Toggle fit-to-width |
-| `Ctrl+=` / `Ctrl++` | Zoom in |
+| `Ctrl+Shift+A` | Toggle accessibility mode |
+| `Ctrl=` / `Ctrl+` | Zoom in |
 | `Ctrl+-` | Zoom out |
 | `Alt+Right` | Next page |
 | `Alt+Left` | Previous page |
@@ -103,8 +129,12 @@ Right-clicking an image region triggers description immediately.
 
 ## Tech Stack
 
-Python · [PyQt6](https://riverbankcomputing.com/software/pyqt/) · [PyMuPDF](https://pymupdf.readthedocs.io/) · [llama.cpp](https://github.com/ggml-org/llama.cpp) · [Gemma 4](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) · [Piper TTS](https://github.com/rhasspy/piper)
+Python · [PyQt6](https://riverbankcomputing.com/software/pyqt/) ·
+[PyMuPDF](https://pymupdf.readthedocs.io/) ·
+[llama.cpp](https://github.com/ggml-org/llama.cpp) ·
+[Gemma 4](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF) ·
+[Piper TTS](https://github.com/rhasspy/piper)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE).

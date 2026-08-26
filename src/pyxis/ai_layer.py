@@ -126,7 +126,7 @@ def ensure_gpu_native(on_status=None):
     except Exception:
         pass
     # Download the CUDA-built libllama for this platform.
-    from storage import app_data_dir
+    from .storage import app_data_dir
     native_dir = app_data_dir() / "native"
     native_dir.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":
@@ -391,7 +391,7 @@ class AILayer:
 
     def _download(self, files, on_status=None, on_progress=None):
         from huggingface_hub import hf_hub_download
-        from storage import app_data_dir
+        from .storage import app_data_dir
         cache_dir = app_data_dir() / "models"
         cache_dir.mkdir(parents=True, exist_ok=True)
         _SignalTqdm._callback = on_progress

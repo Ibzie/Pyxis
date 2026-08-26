@@ -18,6 +18,7 @@ import threading
 import logging
 from collections import deque
 from pathlib import Path
+from PyQt6.QtCore import QThread, pyqtSignal
 
 log = logging.getLogger("speech")
 
@@ -215,7 +216,28 @@ def create_engine(on_status=None):
             raise RuntimeError(f"No TTS backend available: piper={e}, pyttsx3={e2}")
 
 
-from PyQt6.QtCore import QThread, pyqtSignal
+class VoiceLoadWorker(QThread):
+    """Load the (possibly first-run) TTS engine off the GUI thread.
+
+    Piper's voice download (~65 MB) blocks for tens of seconds on a fresh
+    machine; doing that on the GUI thread freezes the whole window (A9).
+    Mirrors the AI layer's LoadWorker: emit `status` during download, then
+    hand the constructed engine back via `done`, or `failed` on error.
+    """
+    status = pyqtSignal(str)
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def run(self):
+        try:
+            engine = create_engine(on_status=lambda m: self.status.emit(m))
+            self.done.emit(engine)
+        except Exception as e:
+            log.error("voice load failed: %s", e)
+            self.failed.emit(str(e))
 
 
 class SpeechQueue(QThread):

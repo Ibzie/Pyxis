@@ -16,6 +16,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
 PROJECT_ROOT = os.path.dirname(SPEC_DIR)
+SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 ONEFILE = os.environ.get("PYXIS_ONEFILE", "") == "1"
 
 # ── Collect native binaries + data from heavy deps ────────────────────────
@@ -71,6 +72,11 @@ print(f"  Filtered {_orig_bin - len(all_bins)} binaries, "
       f"{_orig_data - len(all_datas)} data entries (Qt trim)")
 
 hiddenimports = [
+    # Pyxis package (src/pyxis/ layout) — listed explicitly so lazy
+    # imports inside QThread.run() bodies are always bundled.
+    "pyxis", "pyxis.main", "pyxis.pdf_engine", "pyxis.page_view",
+    "pyxis.notes_panel", "pyxis.storage", "pyxis.ai_layer",
+    "pyxis.ai_workers", "pyxis.speech", "pyxis.narrator", "pyxis.rag",
     "llama_cpp.llama_chat_format",
     "llama_cpp.llama_chat_format.Gemma4ChatHandler",
     "llama_cpp.llama_chat_format.MTMDChatHandler",
@@ -104,8 +110,8 @@ excludes = [
 ]
 
 a = Analysis(
-    [os.path.join(PROJECT_ROOT, "main.py")],
-    pathex=[PROJECT_ROOT],
+    [os.path.join(SRC_DIR, "pyxis", "__main__.py")],
+    pathex=[SRC_DIR],
     binaries=all_bins,
     datas=all_datas,
     hiddenimports=hiddenimports,

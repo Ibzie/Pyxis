@@ -104,7 +104,15 @@ class PdfStorage:
         return f"# Notes: {self.pdf_path.name}\n\n"
 
     def save_notes(self, text):
-        self.notes_file.write_text(text)
+        """Write notes.md atomically (B6): a crash or power loss mid-write
+        must never leave a truncated/corrupt file — write to a sibling temp
+        file, fsync it, then atomically replace the target."""
+        tmp = self.notes_file.with_suffix(self.notes_file.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.notes_file)
 
     def get_highlights_for_page(self, page_idx):
         return [h for h in self.annotations["highlights"] if h["page"] == page_idx]
