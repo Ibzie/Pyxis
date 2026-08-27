@@ -83,6 +83,43 @@ def render_markdown_html(text):
     return html
 
 
+# Readable, widely-available serif stack for the PDF export. Qt substitutes
+# the first family it can't find, so Georgia (Win/mac) falls back cleanly to
+# DejaVu/Times on Linux.
+EXPORT_FONT_FAMILY = "Georgia"
+EXPORT_CSS = f"""
+body {{ font-family: {EXPORT_FONT_FAMILY}, 'Palatino Linotype', 'DejaVu Serif', 'Times New Roman', serif; font-size: 11pt; }}
+h1 {{ font-family: {EXPORT_FONT_FAMILY}, serif; font-size: 24pt; font-weight: bold; margin: 14pt 0 6pt 0; }}
+h2 {{ font-family: {EXPORT_FONT_FAMILY}, serif; font-size: 20pt; font-weight: bold; margin: 12pt 0 5pt 0; }}
+h3 {{ font-family: {EXPORT_FONT_FAMILY}, serif; font-size: 17pt; font-weight: bold; margin: 10pt 0 4pt 0; }}
+h4 {{ font-family: {EXPORT_FONT_FAMILY}, serif; font-size: 15pt; font-weight: bold; margin: 9pt 0 4pt 0; }}
+h5 {{ font-family: {EXPORT_FONT_FAMILY}, serif; font-size: 13pt; font-weight: bold; margin: 8pt 0 3pt 0; }}
+h6 {{ font-family: {EXPORT_FONT_FAMILY}, serif; font-size: 12pt; font-weight: bold; margin: 7pt 0 3pt 0; }}
+p {{ margin: 0 0 8pt 0; }}
+ul, ol {{ margin: 0 0 8pt 0; }}
+li {{ margin: 0 0 2pt 0; }}
+blockquote {{ margin: 4pt 0 8pt 14pt; color: #555555; }}
+code {{ font-family: 'Courier New', 'DejaVu Sans Mono', monospace; font-size: 10pt; background-color: #f2f2f2; }}
+pre {{ font-family: 'Courier New', 'DejaVu Sans Mono', monospace; font-size: 10pt; background-color: #f2f2f2; padding: 6pt; white-space: pre-wrap; }}
+pre code {{ background-color: transparent; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ border: 1px solid #999999; padding: 4pt 6pt; word-wrap: break-word; }}
+th {{ background-color: #efefef; }}
+img {{ max-width: 100%; }}
+hr {{ border: none; border-top: 1px solid #999999; margin: 10pt 0; }}
+"""
+
+
+def _export_html(body):
+    """Wrap markdown-rendered HTML in a full document with our stylesheet,
+    centering standalone image paragraphs based on the image's own width."""
+    # Center a paragraph that contains only an image.
+    body = re.sub(r'<p>\s*(<img[^>]*>)\s*</p>',
+                  r'<p style="text-align:center">\1</p>', body)
+    return (f'<html><head><meta charset="utf-8"><style>{EXPORT_CSS}</style>'
+            f'</head><body>{body}</body></html>')
+
+
 def _split_blocks(src):
     """Split markdown source into logical blocks for the live-preview editor.
 
@@ -470,6 +507,12 @@ class NotesPanel(QWidget):
         self._save_timer.stop()
         self._flush_save()
         doc = QTextDocument()
+        # Readable serif + word wrap that never lets a long line or code
+        # token bleed past the page edge (Qt's rich text engine enforces it).
+        doc.setDefaultFont(QFont(EXPORT_FONT_FAMILY, 11))
+        _to = QTextOption()
+        _to.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        doc.setDefaultTextOption(_to)
         if self._base_dir:
             for raw in self._block_raw:
                 for m in re.finditer(r'!\[[^\]]*\]\(([^)]+)\)', raw):
@@ -488,7 +531,7 @@ class NotesPanel(QWidget):
                     doc.addResource(
                         QTextDocument.ResourceType.ImageResource,
                         QUrl(resolved.as_uri()), pix)
-        doc.setHtml(render_markdown_html(self._resolve_full(self._source)))
+        doc.setHtml(_export_html(render_markdown_html(self._resolve_full(self._source))))
         printer = QPrinter()
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(path)

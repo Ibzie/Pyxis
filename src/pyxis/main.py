@@ -221,8 +221,7 @@ class MainWindow(QMainWindow):
     def _build_notes_panel(self):
         self.notes_panel = NotesPanel()
         self.notes_panel.on_save(self._save_notes)
-        self.notes_panel.setMaximumWidth(420)
-        self.notes_panel.setMinimumWidth(260)
+        self.notes_panel.setMinimumWidth(220)
 
     def _build_viewer(self):
         central = QWidget()
@@ -244,7 +243,12 @@ class MainWindow(QMainWindow):
         self.scroll.setWidget(self.pages_widget)
         self.splitter.addWidget(self.scroll)
         self.splitter.addWidget(self.notes_panel)
-        self.splitter.setSizes([260, 960, 340])
+        # Let the PDF viewer and notes panel share available width equally on
+        # resize (50/50), while the fixed-width sidebar takes no stretch.
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setSizes([260, 560, 560])
         hbox.addWidget(self.splitter)
 
     def _save_notes(self, text):
