@@ -10,14 +10,23 @@ confirmed** at the bottom.
 
 Not committed/pushed — for you to triage into GitHub issues yourself. Severity: 🔴 critical · 🟠 high · 🟡 medium · ⚪ low.
 
+## Status (updated 2026-08-29)
+
+Tickets fixed in the current working tree (repo restructure + crash fixes + notes-editor rewrite):
+**A1 · A9 · B1 · B2 · B3 · B4 · B5 · B6 · B7 · C1 · F1 · F2 · G1 · H1** — each marked `✅ RESOLVED` below.
+Partially addressed: **G4** (`notes.md` writes are now atomic; `annotations.json` still uses a plain `write_text`).
+All other tickets remain open. Tests were headless (offscreen Qt + PyMuPDF) — no formal test suite exists.
+
 ---
+
+## Epic A — Accessibility & TTS core reliability
 
 ## Epic A — Accessibility & TTS core reliability
 *This is the product's core value prop for blind users — these bugs mean the headline feature is currently broken in several ways.*
 
-- **A1** 🔴 **`R`/`C` keys crash narration entirely — `self._narrator` instance attribute shadows the `_narrator()` method**
+- **A1** 🔴 **`R`/`C` keys crash narration entirely — `self._narrator` instance attribute shadows the `_narrator()` method** — ✅ **RESOLVED**
   `MainWindow.__init__` sets `self._narrator = None` (`main.py:71`), but the class also defines `def _narrator(self):` (`main.py:778-789`) as a lazy getter that's supposed to build the `NarratorWorker`. Because a plain instance attribute always wins over a same-named method in Python's attribute lookup, `self._narrator` is permanently `None`. Every call site (`main.py:804, 822, 827`) does `self._narrator()` → `TypeError: 'NoneType' object is not callable`. Reproduced live: pressing `R` or `C` throws every time.
-  *Fix: rename the instance attribute (e.g. `self._narrator_worker`) so it stops shadowing the method.*
+  *Fix: rename the instance attribute (e.g. `self._narrator_worker`) so it stops shadowing the method.* — applied: attribute is now `self._narrator_worker` everywhere (`__init__`, `_a11y_off`, `_narrator()`, `closeEvent`).
 
 - **A2** 🟠 **"Continue reading" resume position races ahead of actual playback — can silently skip content**
   `NarratorWorker._narrate_page` (`narrator.py:93-108`) emits `chunk_progress`/`page_done` right after *enqueueing* text to the (non-blocking) `SpeechQueue`, not after it's actually spoken. `MainWindow` persists that position to disk immediately (`main.py:876-889`). Stopping/closing while chunk 0 is still playing leaves the saved resume point at or past the end of the page — reopening later skips unheard content.
@@ -38,7 +47,8 @@ Not committed/pushed — for you to triage into GitHub issues yourself. Severity
 
 - **A8** 🟠 **"Read current page" / "Continue reading" are needlessly gated behind a fully-loaded LLM + completed RAG index**, even though `NarratorWorker` already has a working plain-text (PyMuPDF) fallback that needs neither (`narrator.py:82-92`). Right now the single most basic accessibility action is blocked behind downloading/loading a multi-GB model.
 
-- **A9** 🔴 **Enabling accessibility mode freezes the whole UI during the first-run Piper voice download (~65MB, no threading, no progress bar)** — `PiperEngine.__init__` runs two blocking `hf_hub_download()` calls directly on the GUI thread (`speech.py:75-102`), unlike the Gemma model loader which is correctly wrapped in a `QThread` with progress signals (`ai_workers.py:5-28`). On a fresh machine or after a cache clear, the window appears hung for the whole download.
+- **A9** 🔴 **Enabling accessibility mode freezes the whole UI during the first-run Piper voice download (~65MB, no threading, no progress bar)** — ✅ **RESOLVED** — `PiperEngine.__init__` runs two blocking `hf_hub_download()` calls directly on the GUI thread (`speech.py:75-102`), unlike the Gemma model loader which is correctly wrapped in a `QThread` with progress signals (`ai_workers.py:5-28`). On a fresh machine or after a cache clear, the window appears hung for the whole download.
+  *Fixed: the voice download now runs in a `VoiceLoadWorker` QThread (`speech.py`), started by `_a11y_on()`; `_a11y_on()` returns immediately (measured ~0ms) and binds the `SpeechQueue` via the `done` signal. `R`/`C`/`N` show "TTS voice still loading…" until ready; `closeEvent` waits for the worker.*
 
 - **A10** 🟡 *(feature)* **Export page/document narration as a standalone WAV file** — `PiperEngine.speak()` already produces raw int16 PCM per sentence (`speech.py:129`); redirecting those frames to a `wave.open()` writer (instead of/alongside live playback) is a small, well-scoped addition.
 
@@ -49,31 +59,33 @@ Not committed/pushed — for you to triage into GitHub issues yourself. Severity
 ## Epic B — Notes editor: WYSIWYG correctness & data integrity
 *Directly addresses your "notes section is unrendered markdown while editing" complaint — some constructs genuinely aren't handled, and there are real corruption bugs around inline images.*
 
-- **B1** 🔴 **Deleting one of several inline images silently reassigns a *different* image's markdown to the wrong picture, corrupting `notes.md` on the very next autosave.**
+- **B1** 🔴 **Deleting one of several inline images silently reassigns a *different* image's markdown to the wrong picture, corrupting `notes.md` on the very next autosave.** — ✅ **RESOLVED**
   `_on_edit()`'s image-reconciliation (`notes_panel.py:438-456`) matches images to markdown purely by *count*, and on deletion always drops the **last** tracked entry (`self._image_list[:n_imgs]`) regardless of which image was actually removed. Reproduced directly: deleting the *first* of two images left the still-present second image mislabeled with the first image's file path.
+  *Fixed by design in the rewrite: each logical block's raw markdown is independent (`_block_raw`), images only render inside non-focused blocks, and the editable block shows raw `![alt](path)` text — deleting one image can never relabel another. Verified headless (delete first of two images → second intact).*
 
-- **B2** 🟠 **Pasting text containing a literal U+FFFC character discards image tracking and corrupts the saved note.** Reproduced: inserting `"pasted ￼ stray char"` into a note with one tracked image caused `_source` to lose the real image markdown entirely, replaced by an inert placeholder glyph. Autosave (fires every keystroke) then bakes the corruption into `notes.md`.
+- **B2** 🟠 **Pasting text containing a literal U+FFFC character discards image tracking and corrupts the saved note.** Reproduced: inserting `"pasted ￼ stray char"` into a note with one tracked image caused `_source` to lose the real image markdown entirely, replaced by an inert placeholder glyph. Autosave (fires every keystroke) then bakes the corruption into `notes.md`. — ✅ **RESOLVED** — `_WysiwygEdit.insertFromMimeData` now strips U+FFFC from pasted text (B2); the rewrite no longer uses U+FFFC object chars in the editable source at all.
 
-- **B3** 🟠 **Hidden markdown markers are ordinary editable characters — placing the cursor between them and typing un-hides the rest of the construct as raw, visible markdown.** `_invisible()` (`notes_panel.py:69-72`) only recolors marker characters to match the background; they're still normal cursor-navigable positions. Reproduced: typing inside `**bold**`'s opening marker turned it into `*X*bold**`, which re-parses as an italic run followed by fully-visible raw `bold**` text.
+- **B3** 🟠 **Hidden markdown markers are ordinary editable characters — placing the cursor between them and typing un-hides the rest of the construct as raw, visible markdown.** `_invisible()` (`notes_panel.py:69-72`) only recolors marker characters to match the background; they're still normal cursor-navigable positions. Reproduced: typing inside `**bold**`'s opening marker turned it into `*X*bold**`, which re-parses as an italic run followed by fully-visible raw `bold**` text. — ✅ **RESOLVED** — the `QSyntaxHighlighter` recolor approach was removed entirely; non-focused blocks are rendered fragments with **no marker characters present**, and the focused block shows raw markdown by design. Nothing to "un-hide".
 
-- **B4** 🟠 **"Read notes aloud" (`N`) speaks raw Markdown syntax verbatim** — `get_text()` returns the raw source unmodified, and there is no markdown-to-speech cleanup anywhere in the app. A blind user pressing `N` hears literal `#`, `**`, `- [ ]`, and full image file paths instead of clean prose.
+- **B4** 🟠 **"Read notes aloud" (`N`) speaks raw Markdown syntax verbatim** — `get_text()` returns the raw source unmodified, and there is no markdown-to-speech cleanup anywhere in the app. A blind user pressing `N` hears literal `#`, `**`, `- [ ]`, and full image file paths instead of clean prose. — ✅ **RESOLVED** — `NotesPanel.get_plain_text()` projects markdown to prose (strips headers/markers, unwraps links, replaces images with alt text, drops fenced code); `MainWindow._read_notes_aloud` uses it.
 
-- **B5** 🟡 **The live WYSIWYG highlighter is missing rules for several common constructs that PDF export *does* support**: fenced code blocks (```` ``` ````), tables (even though `.enable("table")` is on for export), plain (non-checkbox) bullet lists, ordered lists, strikethrough, and multi-line `$$...$$` block math that spans more than one line (the highlighter only sees one line/block at a time). These render as fully raw, unstyled markdown in the editor — this is very likely the main thing behind "it's unrendered markdown while editing."
+- **B5** 🟡 **The live WYSIWYG highlighter is missing rules for several common constructs that PDF export *does* support**: fenced code blocks (```` ``` ````), tables (even though `.enable("table")` is on for export), plain (non-checkbox) bullet lists, ordered lists, strikethrough, and multi-line `$$...$$` block math that spans more than one line (the highlighter only sees one line/block at a time). These render as fully raw, unstyled markdown in the editor — this is very likely the main thing behind "it's unrendered markdown while editing." — ✅ **RESOLVED** — the editor renders every block through `render_markdown_html` (markdown-it with table/strikethrough/math plugins), so all these constructs render live.
 
-- **B6** 🟡 **Autosave has no debounce and writes the entire file non-atomically on every single keystroke.** `textChanged` → `_on_edit` → callback → `storage.save_notes()` → `Path.write_text()` (truncate-then-write, no temp-file+rename) fires on every keystroke with no timer. A crash/power-loss mid-write has an unusually large exposure window to truncate `notes.md`. (The one debounce timer that exists in this file is wired only to AI-streaming output, not typing.)
+- **B6** 🟡 **Autosave has no debounce and writes the entire file non-atomically on every single keystroke.** `textChanged` → `_on_edit` → callback → `storage.save_notes()` → `Path.write_text()` (truncate-then-write, no temp-file+rename) fires on every keystroke with no timer. A crash/power-loss mid-write has an unusually large exposure window to truncate `notes.md`. (The one debounce timer that exists in this file is wired only to AI-streaming output, not typing.) — ✅ **RESOLVED** — `NotesPanel` debounces saves (300 ms single-shot timer); `storage.save_notes()` writes atomically (temp file + `fsync` + `os.replace`).
 
-- **B7** ⚪ **A broken/missing inline image reference is left as ambiguous dimmed raw markdown text**, with no distinct "image failed to load" indicator to tell it apart from intentionally-unrendered syntax.
+- **B7** ⚪ **A broken/missing inline image reference is left as ambiguous dimmed raw markdown text**, with no distinct "image failed to load" indicator to tell it apart from intentionally-unrendered syntax. — ✅ **RESOLVED** — `_resolve_block`/`_resolve_full` leave missing image refs as relative paths (not `file://` URIs), which render as an unresolved `<img>` (broken-image placeholder) in the live view/export instead of ambiguous dimmed text.
 
 ---
 
 ## Epic C — Notes PDF export never embeds images (confirmed root cause, reproduced against your real PDF)
 *This is your "image export properly in notes" complaint — it is a real, currently-broken bug, not a stale worry. One reviewer initially concluded it was already fixed by only checking that the code's URL-matching logic was internally consistent; it hadn't actually run the render step. Three independent reproductions (two agents + my own manual test) prove it's broken.*
 
-- **C1** 🔴 **`export_pdf()` always prints the literal `![alt](file:///abs/path.png)` text instead of the image bitmap — for every local image, unconditionally.**
+- **C1** 🔴 **`export_pdf()` always prints the literal `![alt](file:///abs/path.png)` text instead of the image bitmap — for every local image, unconditionally.** — ✅ **RESOLVED**
   Root cause: `_resolve()` (`notes_panel.py:350-358`) rewrites relative image paths to `file://` URIs before handing the text to `render_markdown_html()`. But `markdown-it-py`'s built-in link/image destination validator (`BAD_PROTO_RE` in `markdown_it/common/normalize_url.py`) **unconditionally rejects the `file:` scheme** (it's a security denylist against `javascript:`/`vbscript:`/`file:`/`data:` URIs) — so `![alt](file:///...)` is never parsed into an `<img>` tag at all; it stays as literal unparsed text. The `QTextDocument.addResource(...)` pre-registration in `export_pdf()` therefore has nothing to bind to and is silently unused.
   **I personally reproduced this end-to-end against your real `k3_tech_report.pdf`**: rendered page 3 of the actual PDF to a PNG (simulating a real capture), built a note referencing it via the real `PdfStorage`/`NotesPanel` code, and called the real `export_pdf()` logic headlessly. Screenshot of the **live editor** shows the captured PDF page image rendered correctly inline. Screenshot of the **exported PDF** shows the literal text `![capture from page 3](file:///home/.../captures/cap_p2_test.png)` instead of the image — confirming the bug is real, current, and reproducible with a real document, not just a synthetic test string. Isolated `markdown-it` bisection confirms: `![alt](/tmp/x.png)` → proper `<img>`; `![alt](file:///tmp/x.png)` → literal text, in every plugin combination the app uses.
   *Fix: don't rewrite paths to `file://` URIs before parsing — pass plain absolute filesystem paths (which `markdown-it` parses fine and Qt also resolves), or construct the `MarkdownIt` instance with a custom `validateLink` that allows `file:`.*
   *Related edge case surfaced during review: if the image file is missing, the resource-registration loop skips it, but `_resolve()` still rewrites the link to a `file://` URI — worth handling in the same fix.*
+  *Applied: `render_markdown_html` overrides `md.validateLink` to allow the `file:` scheme (safe — output goes to `QTextDocument`/PDF, never a browser), so `QTextDocument.addResource` binds and the bitmap embeds. `_resolve`/`_resolve_block` now skip missing files. Verified headless: exported PDF contains the image XObject with no literal markdown text.*
 
 ---
 
@@ -100,9 +112,9 @@ Not committed/pushed — for you to triage into GitHub issues yourself. Severity
 ---
 
 ## Epic F — Core PDF reader: crash safety & navigation
-- **F1** 🔴 **Whole app hard-crashes (SIGABRT) if `Ctrl+0` is pressed twice before opening any PDF.** `_apply_zoom()` indexes `self.engine.page_sizes[0][0]` unconditionally; with no PDF loaded that list is empty. Reproduced live: two genuine `Ctrl+0` key events → `IndexError` → process exit code 134.
+- **F1** 🔴 **Whole app hard-crashes (SIGABRT) if `Ctrl+0` is pressed twice before opening any PDF.** `_apply_zoom()` indexes `self.engine.page_sizes[0][0]` unconditionally; with no PDF loaded that list is empty. Reproduced live: two genuine `Ctrl+0` key events → `IndexError` → process exit code 134. — ✅ **RESOLVED** — `_apply_zoom()` early-returns when `not self.engine.doc or not self.engine.page_sizes or not self.pages`. Verified headless.
 
-- **F2** 🔴 **No global exception handler anywhere — any uncaught exception in a Qt slot kills the entire process instantly, discarding unsaved notes.** Only 3 real `except` blocks exist in all of `main.py`'s 1128 lines; there is no `sys.excepthook` and no wrapper around `app.exec()`. F1 above is a live demonstration of exactly this.
+- **F2** 🔴 **No global exception handler anywhere — any uncaught exception in a Qt slot kills the entire process instantly, discarding unsaved notes.** Only 3 real `except` blocks exist in all of `main.py`'s 1128 lines; there is no `sys.excepthook` and no wrapper around `app.exec()`. F1 above is a live demonstration of exactly this. — ✅ **RESOLVED** — `_install_excephook()` installs a `sys.excepthook` (logs to `ai.log`, shows a contained dialog on the main thread); exceptions on worker threads are logged only. Verified: a raised exception in a `QTimer` slot is contained and the app continues (exit 0).
 
 - **F3** 🟠 **Keyboard scrolling (arrow keys, PageUp/PageDown, Home/End) doesn't work anywhere in the document view.** `PageView` never calls `setFocus()` on click, and `MainWindow.keyPressEvent` has no handling for these keys — the scroll area's own built-in key handling is fully functional but unreachable because nothing ever routes focus to it. Reproduced live (manually focusing the scroll area proves the underlying scroll logic works fine).
 
@@ -117,20 +129,20 @@ Not committed/pushed — for you to triage into GitHub issues yourself. Severity
 ---
 
 ## Epic G — Storage & data safety
-- **G1** 🟠 **Opening a PDF when the data directory isn't writable crashes the whole app** — `load_pdf()`'s try/except only wraps `PdfEngine.open()`; the next line, `PdfStorage(path)` (which does an unguarded `mkdir`), is outside it. Reproduced: a read-only data directory raises an uncaught `PermissionError`. Combined with F2 (no global handler), this SIGABRTs the process.
+- **G1** 🟠 **Opening a PDF when the data directory isn't writable crashes the whole app** — `load_pdf()`'s try/except only wraps `PdfEngine.open()`; the next line, `PdfStorage(path)` (which does an unguarded `mkdir`), is outside it. Reproduced: a read-only data directory raises an uncaught `PermissionError`. Combined with F2 (no global handler), this SIGABRTs the process. — ✅ **RESOLVED** — `PdfStorage(path)` (and notes load) moved inside `load_pdf`'s try/except; failures surface as a `QMessageBox` instead of a crash.
 
 - **G2** 🟠 **Filename sanitization collides distinct documents into one notes folder, leaking one PDF's notes/highlights into another's.** `_safe_name()` maps every non-alphanumeric character to `_` with no collision check — reproduced directly: `"a b.pdf"` and `"a_b.pdf"` both sanitize to the identical folder name.
 
 - **G3** 🟠 **No locking on `notes.md`/`annotations.json` — opening the same PDF twice (or two instances) causes a silent lost-update race.** Both files are loaded once into memory and every save blindly overwrites the whole file from that stale in-memory snapshot, with no re-read-and-merge.
 
-- **G4** 🟠 **`notes.md`/`annotations.json` are written non-atomically** (`Path.write_text()` truncates immediately, no temp-file+rename) — a crash or kill mid-save can destroy the file rather than just losing the latest edit.
+- **G4** 🟠 **`notes.md`/`annotations.json` are written non-atomically** (`Path.write_text()` truncates immediately, no temp-file+rename) — a crash or kill mid-save can destroy the file rather than just losing the latest edit. — 🟡 **PARTIALLY RESOLVED** — `storage.save_notes()` now writes `notes.md` atomically (temp file + `fsync` + `os.replace`); `annotations.json` (`_save_json`) still uses a plain `write_text`.
 
 - **G5** 🟡 **Password-protected PDFs are unconditionally rejected with no password-entry UI** — the failure is caught gracefully (no crash), but there's no retry-with-password path.
 
 ---
 
 ## Epic H — Product & hackathon-demo polish
-- **H1** 🟠 **README's accessibility shortcut table is missing two real, working shortcuts** (`C` — continue reading cross-session, `?` — accessibility help) that exist in code and in `AGENTS.md`. A judge reading only the public README would miss the "resume where I left off" feature entirely.
+- **H1** 🟠 **README's accessibility shortcut table is missing two real, working shortcuts** (`C` — continue reading cross-session, `?` — accessibility help) that exist in code and in `AGENTS.md`. A judge reading only the public README would miss the "resume where I left off" feature entirely. — ✅ **RESOLVED** — README and `docs/accessibility.md` now list `C` and `?` (plus `Ctrl+Shift+A`).
 - **H2** 🟡 **No visible progress indicator for either first-run download** (multi-GB AI model, ~65MB voice) beyond status-bar text; the voice download additionally blocks the UI thread entirely (see **A9**).
 
 ---
