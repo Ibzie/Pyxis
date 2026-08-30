@@ -1,23 +1,27 @@
 import sys, json, os, logging, logging.handlers, threading
 from datetime import datetime
 from pathlib import Path
-from PyQt6.QtCore import Qt, QPoint, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QKeyEvent, QCursor, QAction
+from PyQt6.QtCore import Qt, QPoint, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QKeyEvent, QCursor, QAction, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QLineEdit, QPushButton, QScrollArea, QFrame,
     QFileDialog, QMessageBox, QMenu, QListWidget, QListWidgetItem,
     QStatusBar, QSplitter, QInputDialog, QProgressBar, QWidgetAction,
-    QSlider, QDialog, QTextEdit
+    QSlider, QDialog, QTextEdit, QTabWidget, QCheckBox
 )
-from .pdf_engine import PdfEngine, ZOOM_LEVELS
+from .pdf_engine import PdfEngine, ZOOM_LEVELS, PasswordRequired
 from .page_view import PageView
 from .notes_panel import NotesPanel
-from .storage import PdfStorage
+from .storage import (
+    PdfStorage, a11y_onboarded, mark_a11y_onboarded,
+    load_settings, save_settings,
+)
 from .ai_layer import AILayer, TIERS, detect_capacity, fit_level
 from .ai_workers import LoadWorker, InferWorker, IndexWorker
-from .speech import SpeechQueue, VoiceLoadWorker
+from .speech import SpeechQueue, VoiceLoadWorker, WavExportWorker
 from .narrator import NarratorWorker
+from .whiteboard import WhiteboardWidget
 
 
 # Accessibility keybind reference — shown in the Help window and spoken
@@ -74,18 +78,102 @@ class MainWindow(QMainWindow):
         self._a11y_volume = 1.0  # 0.0–1.0
         self._resume_pos = None     # last persisted (page, chunk)
         self._a11y_help_win = None  # Help dialog (kept alive for non-modal show)
+        self._esc_target = None     # "ai" | "narration" — what Esc stops next (A3)
+        # F5: debounces the full page re-render after a fit-width resize drag.
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(lambda: self._apply_zoom())
+        # D1: debounced whiteboard autosave.
+        self._whiteboard_timer = QTimer(self)
+        self._whiteboard_timer.setSingleShot(True)
+        self._whiteboard_timer.setInterval(500)
+        self._whiteboard_timer.timeout.connect(self._save_whiteboard_now)
+        # A11: low-vision UI settings (font scale / high contrast), persisted.
+        self._font_scale = 1.0
+        self._high_contrast = False
         self.setWindowTitle("Pyxis — PDF Reader")
         self.resize(1600, 900)
-        self.setStyleSheet("background-color: #121212; color: #eeeeee;")
         self._build_toolbar()
         self._build_sidebar()
         self._build_notes_panel()
         self._build_viewer()
+        self._apply_ui_settings()
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        # H2: a visible busy indicator for the first-run voice download.
+        self._voice_progress = QProgressBar()
+        self._voice_progress.setRange(0, 0)
+        self._voice_progress.setFixedWidth(160)
+        self._voice_progress.setTextVisible(False)
+        self._voice_progress.setVisible(False)
+        self.status.addPermanentWidget(self._voice_progress)
         self.status.showMessage("Ready — Open a PDF file (Ctrl+O)")
         if cli_path:
             self.load_pdf(cli_path)
+
+    def _theme_stylesheet(self):
+        """Window-level background/text colors; high contrast is pure black/
+        white for low-vision users (A11)."""
+        if self._high_contrast:
+            return "background-color: #000000; color: #ffffff;"
+        return "background-color: #121212; color: #eeeeee;"
+
+    def _apply_ui_settings(self):
+        s = load_settings()
+        self._font_scale = float(s.get("font_scale", 1.0)) or 1.0
+        self._high_contrast = bool(s.get("high_contrast", False))
+        self.setStyleSheet(self._theme_stylesheet())
+        _apply_app_palette(QApplication.instance(), self._high_contrast)
+        self._set_ui_scale(self._font_scale)
+
+    def _set_ui_scale(self, scale):
+        self._font_scale = scale
+        base = 10.0 * scale
+        app_font = QFont()
+        app_font.setPointSizeF(max(6.0, base))
+        QApplication.instance().setFont(app_font)
+        if hasattr(self, "notes_panel"):
+            self.notes_panel.set_ui_scale(scale)
+
+    def _set_high_contrast(self, enabled):
+        self._high_contrast = enabled
+        self.setStyleSheet(self._theme_stylesheet())
+        _apply_app_palette(QApplication.instance(), enabled)
+
+    def _show_ui_settings(self):
+        """Dialog to adjust UI font size and high-contrast colors (A11)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("UI Settings — font size & contrast")
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("Interface font size:"))
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(9, 22)
+        slider.setValue(int(10.0 * self._font_scale))
+        slider.setAccessibleName("Interface font size")
+        layout.addWidget(slider)
+        cont = QCheckBox("High-contrast colors (pure black & white)")
+        cont.setChecked(self._high_contrast)
+        cont.setAccessibleName("High-contrast colors")
+        layout.addWidget(cont)
+        row = QHBoxLayout()
+        def apply():
+            scale = slider.value() / 10.0
+            self._set_ui_scale(scale)
+            self._set_high_contrast(cont.isChecked())
+            save_settings({"font_scale": scale, "high_contrast": cont.isChecked()})
+            dlg.accept()
+        ok = QPushButton("Apply")
+        ok.setAccessibleName("Apply UI settings")
+        ok.clicked.connect(apply)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dlg.reject)
+        row.addStretch()
+        row.addWidget(ok)
+        row.addWidget(cancel)
+        layout.addLayout(row)
+        dlg.exec()
 
     def _build_toolbar(self):
         self.toolbar = QToolBar()
@@ -96,42 +184,75 @@ class MainWindow(QMainWindow):
             "QPushButton:hover { background: #444; }"
             "QLineEdit { background: #2a2a2a; color: #eee; border: 1px solid #444; padding: 2px; }"
         )
+
+        def _btn(text, tip, fn, checkable=False):
+            """Toolbar button with a real name for OS screen readers (A6) —
+            icon-only glyphs otherwise announce as '◀'/'🎧' etc."""
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setAccessibleName(tip)
+            b.setCheckable(checkable)
+            b.clicked.connect(fn)
+            return b
+
         self.page_label = QLabel("0 / 0")
+        self.page_label.setAccessibleName("Current page")
         self.zoom_label = QLabel("Fit Width")
+        self.zoom_label.setAccessibleName("Zoom level")
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search...")
         self.search_box.setFixedWidth(200)
+        self.search_box.setAccessibleName("Search PDF")
         self.search_box.returnPressed.connect(self.search)
         self.search_info = QLabel("")
-        self.toolbar.addWidget(QPushButton("Open", clicked=self.open_file))
-        self.toolbar.addWidget(QPushButton("◀", clicked=self.prev_page))
+        self.search_info.setAccessibleName("Search results")
+        self.btn_open = _btn("Open", "Open PDF file (Ctrl+O)", self.open_file)
+        self.btn_prev = _btn("◀", "Previous page", self.prev_page)
+        self.btn_next = _btn("▶", "Next page", self.next_page)
+        self.btn_zoom_out = _btn("−", "Zoom out", lambda: self._adjust_zoom(-1))
+        self.btn_zoom_in = _btn("+", "Zoom in", lambda: self._adjust_zoom(1))
+        self.btn_fit_width = _btn("⊞", "Toggle fit to width (Ctrl+0)", self.toggle_fit_width)
+        self.btn_search_next = _btn("↓", "Next search result", lambda: self._navigate_search(1))
+        self.btn_search_prev = _btn("↑", "Previous search result", lambda: self._navigate_search(-1))
+        self.btn_clear_search = _btn("✕", "Clear search", self.clear_search)
+        self.btn_sidebar = _btn("☰", "Toggle sidebar", self.toggle_sidebar)
+        self.btn_notes = _btn("📝", "Toggle notes panel", self.toggle_notes)
+        self.a11y_toggle_btn = _btn(
+            "🎧", "Toggle accessibility mode (Ctrl+Shift+A)", self.toggle_a11y, checkable=True)
+        self.btn_ui_settings = _btn(
+            "Aa", "Interface font size & contrast", self._show_ui_settings)
+        self.toolbar.addWidget(self.btn_open)
+        self.toolbar.addWidget(self.btn_prev)
         self.toolbar.addWidget(self.page_label)
-        self.toolbar.addWidget(QPushButton("▶", clicked=self.next_page))
+        self.toolbar.addWidget(self.btn_next)
         self.toolbar.addSeparator()
-        self.toolbar.addWidget(QPushButton("−", clicked=lambda: self._adjust_zoom(-1)))
+        self.toolbar.addWidget(self.btn_zoom_out)
         self.toolbar.addWidget(self.zoom_label)
-        self.toolbar.addWidget(QPushButton("+", clicked=lambda: self._adjust_zoom(1)))
-        self.toolbar.addWidget(QPushButton("⊞", clicked=self.toggle_fit_width))
+        self.toolbar.addWidget(self.btn_zoom_in)
+        self.toolbar.addWidget(self.btn_fit_width)
         self.toolbar.addSeparator()
         self.toolbar.addWidget(self.search_box)
         self.toolbar.addWidget(self.search_info)
-        self.toolbar.addWidget(QPushButton("↓", clicked=lambda: self._navigate_search(1)))
-        self.toolbar.addWidget(QPushButton("↑", clicked=lambda: self._navigate_search(-1)))
-        self.toolbar.addWidget(QPushButton("✕", clicked=self.clear_search))
+        self.toolbar.addWidget(self.btn_search_next)
+        self.toolbar.addWidget(self.btn_search_prev)
+        self.toolbar.addWidget(self.btn_clear_search)
         self.toolbar.addSeparator()
-        self.toolbar.addWidget(QPushButton("☰", clicked=self.toggle_sidebar))
-        self.toolbar.addWidget(QPushButton("📝", clicked=self.toggle_notes))
-        self.toolbar.addWidget(QPushButton("🎧", clicked=self.toggle_a11y,
-                                          checkable=True))
+        self.toolbar.addWidget(self.btn_sidebar)
+        self.toolbar.addWidget(self.btn_notes)
+        self.toolbar.addWidget(self.a11y_toggle_btn)
+        self.toolbar.addWidget(self.btn_ui_settings)
         self.toolbar.addSeparator()
         self.model_label = QPushButton("AI: idle")
         self.model_label.setStyleSheet(
             "QPushButton { background: #2a2a2a; color: #aaa; border: 1px solid #444; "
             "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }"
         )
+        self.model_label.setToolTip("AI model status — click to load or switch")
+        self.model_label.setAccessibleName("AI model status")
         self.model_label.clicked.connect(self.show_model_menu)
         self.toolbar.addWidget(self.model_label)
-        self.toolbar.addWidget(QPushButton("AI", clicked=self.show_ai_menu))
+        self.ai_menu_btn = _btn("AI", "AI actions menu", self.show_ai_menu)
+        self.toolbar.addWidget(self.ai_menu_btn)
         self.ai_progress = QProgressBar()
         self.ai_progress.setFixedWidth(200)
         self.ai_progress.setTextVisible(True)
@@ -168,6 +289,7 @@ class MainWindow(QMainWindow):
         self.a11y_speed.setValue(100)
         self.a11y_speed.setFixedWidth(120)
         self.a11y_speed.setToolTip("Narration speed (0.5×–2.0×)")
+        self.a11y_speed.setAccessibleName("Narration speed")
         self.a11y_speed.valueChanged.connect(self._on_a11y_speed)
         self.a11y_vol_lbl = QLabel("Volume: 100%")
         self.a11y_volume = QSlider(Qt.Orientation.Horizontal)
@@ -175,15 +297,28 @@ class MainWindow(QMainWindow):
         self.a11y_volume.setValue(100)
         self.a11y_volume.setFixedWidth(120)
         self.a11y_volume.setToolTip("Narration volume (0–100%)")
+        self.a11y_volume.setAccessibleName("Narration volume")
         self.a11y_volume.valueChanged.connect(self._on_a11y_volume)
         self.a11y_play_btn = QPushButton("⏸ Pause", checkable=True)
+        self.a11y_play_btn.setToolTip("Pause or resume narration")
+        self.a11y_play_btn.setAccessibleName("Pause or resume narration")
         self.a11y_play_btn.clicked.connect(self._on_a11y_play_toggled)
         self.a11y_stop_btn = QPushButton("⏹ Stop")
+        self.a11y_stop_btn.setToolTip("Stop narration and clear the queue")
+        self.a11y_stop_btn.setAccessibleName("Stop narration and clear the queue")
         self.a11y_stop_btn.clicked.connect(self._stop_narration)
         self.a11y_continue_btn = QPushButton("⏭ Continue")
+        self.a11y_continue_btn.setToolTip("Continue reading from saved position")
+        self.a11y_continue_btn.setAccessibleName("Continue reading from saved position")
         self.a11y_continue_btn.clicked.connect(self._continue_reading)
         self.a11y_help_btn = QPushButton("? Help")
+        self.a11y_help_btn.setToolTip("Accessibility help (keyboard shortcuts)")
+        self.a11y_help_btn.setAccessibleName("Accessibility help (keyboard shortcuts)")
         self.a11y_help_btn.clicked.connect(self._show_a11y_help)
+        self.a11y_wav_btn = QPushButton("⏺ Save Audio")
+        self.a11y_wav_btn.setToolTip("Export the current page's narration as a WAV file")
+        self.a11y_wav_btn.setAccessibleName("Export the current page narration as WAV")
+        self.a11y_wav_btn.clicked.connect(self._export_page_wav)
         self.a11y_bar.addWidget(QLabel("🎧"))
         self.a11y_bar.addWidget(QLabel("Speed:"))
         self.a11y_bar.addWidget(self.a11y_speed)
@@ -197,6 +332,7 @@ class MainWindow(QMainWindow):
         self.a11y_bar.addWidget(self.a11y_stop_btn)
         self.a11y_bar.addWidget(self.a11y_continue_btn)
         self.a11y_bar.addWidget(self.a11y_help_btn)
+        self.a11y_bar.addWidget(self.a11y_wav_btn)
         self.addToolBarBreak()  # second toolbar row below the main one
         self.addToolBar(self.a11y_bar)
         self.a11y_bar.setVisible(False)
@@ -221,7 +357,36 @@ class MainWindow(QMainWindow):
     def _build_notes_panel(self):
         self.notes_panel = NotesPanel()
         self.notes_panel.on_save(self._save_notes)
+        self.notes_panel.on_export(self._whiteboard_export_md)
         self.notes_panel.setMinimumWidth(220)
+        # D1: Notes and a freehand Whiteboard live in the same right-hand tab.
+        self.whiteboard = WhiteboardWidget()
+        self.whiteboard.changed.connect(self._schedule_whiteboard_save)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setAccessibleName("Right panel")
+        self.right_tabs.addTab(self.notes_panel, "Notes")
+        self.right_tabs.addTab(self.whiteboard, "Whiteboard")
+        self.right_tabs.currentChanged.connect(self._on_right_tab_changed)
+
+    def _on_right_tab_changed(self, idx):
+        # D1: leaving the Whiteboard tab persists any pending strokes.
+        if self.right_tabs.indexOf(self.whiteboard) != idx:
+            self._save_whiteboard_now()
+
+    def _schedule_whiteboard_save(self):
+        if self.storage:
+            self._whiteboard_timer.start()
+
+    def _save_whiteboard_now(self):
+        if self.storage and self.whiteboard.has_content():
+            self.storage.save_whiteboard(self.whiteboard.get_pixmap())
+
+    def _whiteboard_export_md(self):
+        """Extra markdown for notes-PDF export: the whiteboard image (D1)."""
+        if not self.storage or not self.whiteboard.has_content():
+            return ""
+        self._save_whiteboard_now()
+        return "## Whiteboard\n\n![whiteboard](whiteboard.png)"
 
     def _build_viewer(self):
         central = QWidget()
@@ -242,7 +407,7 @@ class MainWindow(QMainWindow):
         self.pages_layout.addStretch()
         self.scroll.setWidget(self.pages_widget)
         self.splitter.addWidget(self.scroll)
-        self.splitter.addWidget(self.notes_panel)
+        self.splitter.addWidget(self.right_tabs)
         # Let the PDF viewer and notes panel share available width equally on
         # resize (50/50), while the fixed-width sidebar takes no stretch.
         self.splitter.setStretchFactor(0, 0)
@@ -285,14 +450,37 @@ class MainWindow(QMainWindow):
             self.load_pdf(path)
 
     def load_pdf(self, path):
+        password = None
+        while True:
+            try:
+                self.engine.open(path, password=password)
+                break
+            except PasswordRequired:
+                # G5: password-protected PDFs prompt instead of being rejected.
+                if password is not None:
+                    password = None
+                    QMessageBox.warning(
+                        self, "Pyxis", "That password was not correct. Try again.")
+                password, ok = QInputDialog.getText(
+                    self, "Password Required",
+                    f"{Path(path).name} is password-protected. Enter the password:",
+                    QLineEdit.EchoMode.Password)
+                if not ok or not password:
+                    QMessageBox.information(
+                        self, "Pyxis", "Could not open the password-protected PDF.")
+                    return
+                continue
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{e}")
+                return
         try:
-            self.engine.open(path)
             # PdfStorage does an unguarded mkdir here; an unwritable data
             # dir would otherwise raise PermissionError and (with no global
             # handler) SIGABRT the whole process.
             self.storage = PdfStorage(path)
             self.notes_panel.set_text(self.storage.load_notes())
             self.notes_panel.set_base_dir(self.storage.folder)
+            self.whiteboard.load_from_path(self.storage.whiteboard_file)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{e}")
             return
@@ -348,23 +536,51 @@ class MainWindow(QMainWindow):
             self.pages.append(page)
         self._apply_zoom()
 
-    def _apply_zoom(self):
+    def _apply_zoom(self, render_visible_only=False):
         # No document loaded yet (e.g. Ctrl+0 pressed on the welcome
         # screen) — page_sizes is empty, so indexing it would SIGABRT.
         if not self.engine.doc or not self.engine.page_sizes or not self.pages:
             return
         if self.fit_width:
-            self.zoom_level = (self.scroll.viewport().width() - 60) / self.engine.page_sizes[0][0]
+            # F4: mixed-size documents render each page at its own width
+            # instead of clamping everything to page 0's width.
+            avail = self.scroll.viewport().width() - 60
+            self.zoom_level = avail / self.engine.page_sizes[0][0]
             self.zoom_label.setText("Fit Width")
         else:
             self.zoom_level = ZOOM_LEVELS[self.zoom_index]
             self.zoom_label.setText(f"{int(self.zoom_level * 100)}%")
-        self.engine.invalidate_cache()
+        # Resizing every page is cheap; re-rendering is not (F5). Fit-width
+        # re-renders only visible pages and lets the debounced full pass in
+        # resizeEvent catch the rest — the LRU cache is never flushed here.
         for page in self.pages:
-            page.set_zoom(self.zoom_level)
-            img = self.engine.render_page(page.page_idx, page.width())
-            page.set_image(img)
-        self.update_current_page()
+            if self.fit_width:
+                page.set_zoom(avail / self.engine.page_sizes[page.page_idx][0])
+            else:
+                page.set_zoom(self.zoom_level)
+        if render_visible_only:
+            self._render_visible_pages()
+        else:
+            for page in self.pages:
+                img = self.engine.render_page(page.page_idx, page.width())
+                page.set_image(img)
+        self.update_current_page(render=False)
+
+    def _render_visible_pages(self):
+        """Re-render only pages inside (or near) the current viewport (F5).
+        Off-screen pages keep their last image and are re-rendered on scroll
+        via update_current_page."""
+        if not self.pages:
+            return
+        sb = self.scroll.verticalScrollBar()
+        top = sb.value()
+        bottom = top + self.scroll.viewport().height()
+        for page in self.pages:
+            py = page.mapTo(self.pages_widget, QPoint(0, 0)).y()
+            h = page.height()
+            if py + h >= top - h and py <= bottom + h:
+                img = self.engine.render_page(page.page_idx, page.width())
+                page.set_image(img)
 
     def _apply_persisted_highlights(self):
         if not self.storage:
@@ -373,7 +589,7 @@ class MainWindow(QMainWindow):
             hls = [h["bbox"] for h in self.storage.get_highlights_for_page(page.page_idx)]
             page.set_highlights(hls)
 
-    def update_current_page(self):
+    def update_current_page(self, render=True):
         if not self.pages:
             return
         y = self.scroll.verticalScrollBar().value()
@@ -385,6 +601,11 @@ class MainWindow(QMainWindow):
                 self.current_page = i
                 break
         self.page_label.setText(f"{self.current_page + 1} / {self.engine.page_count}")
+        # F5: as pages scroll into view, give them a rendered bitmap (they were
+        # skipped by the viewport-aware zoom pass). Cache hits make this cheap.
+        # `render=False` from _apply_zoom avoids re-rendering what it just did.
+        if render:
+            self._render_visible_pages()
 
     def go_to_page(self, idx):
         if not self.pages or idx < 0 or idx >= len(self.pages):
@@ -418,7 +639,7 @@ class MainWindow(QMainWindow):
         self.sidebar.setVisible(not self.sidebar.isVisible())
 
     def toggle_notes(self):
-        self.notes_panel.setVisible(not self.notes_panel.isVisible())
+        self.right_tabs.setVisible(not self.right_tabs.isVisible())
 
     def bookmark_clicked(self, item):
         self.go_to_page(item.data(Qt.ItemDataRole.UserRole))
@@ -427,23 +648,46 @@ class MainWindow(QMainWindow):
         self.search_results = self.engine.search(self.search_box.text())
         self.search_index = 0
         if self.search_results:
+            # F6: "1/N" now counts real in-page hits, not just pages.
             self.search_info.setText(f"1 / {len(self.search_results)}")
-            self.go_to_page(self.search_results[0])
+            self._show_search_hit(0)
         else:
             self.search_info.setText("0 / 0")
+            self._apply_search_highlights()
             self.status.showMessage(f'No results for "{self.search_box.text()}"')
+
+    def _apply_search_highlights(self):
+        """Push every match's bbox to its page so matched text is highlighted
+        on-page (F6)."""
+        per_page = {}
+        for page, bbox in self.search_results:
+            per_page.setdefault(page, []).append(bbox)
+        for p in self.pages:
+            p.set_search_hits(per_page.get(p.page_idx, []))
+
+    def _show_search_hit(self, idx):
+        """Navigate to the given hit and scroll it into the viewport."""
+        page, bbox = self.search_results[idx]
+        self._apply_search_highlights()
+        self.go_to_page(page)
+        page_widget = self.pages[page]
+        py = page_widget.mapTo(self.pages_widget, QPoint(0, 0)).y()
+        y = int(py + bbox[1] * page_widget.zoom - self.scroll.viewport().height() / 2)
+        self.scroll.verticalScrollBar().setValue(max(0, y))
 
     def _navigate_search(self, direction):
         if self.search_results:
             self.search_index = (self.search_index + direction) % len(self.search_results)
             self.search_info.setText(f"{self.search_index + 1} / {len(self.search_results)}")
-            self.go_to_page(self.search_results[self.search_index])
+            self._show_search_hit(self.search_index)
 
     def clear_search(self):
         self.search_box.clear()
         self.search_results = []
         self.search_index = 0
         self.search_info.setText("")
+        for p in self.pages:
+            p.set_search_hits([])
 
     def show_context_menu(self, page_idx, global_pos, pdf_pos):
         page = self.pages[page_idx]
@@ -600,12 +844,19 @@ class MainWindow(QMainWindow):
             menu.addAction("Draft Follow-up", lambda: self._run_ai("draft", notes=notes))
             menu.addAction("Suggest Tags", lambda: self._run_ai("suggest_tags", notes=notes))
         menu.addSeparator()
-        if self.ai_infer and self.ai_infer.isRunning():
+        if ((self.ai_infer and self.ai_infer.isRunning())
+                or (self.ai_loader and self.ai_loader.isRunning())):
             menu.addAction("Cancel AI", self._cancel_ai)
         menu.exec(QCursor.pos())
 
     def _load_ai(self, tier_idx=None):
         if self.ai_loader and self.ai_loader.isRunning():
+            return
+        if self.ai_infer and self.ai_infer.isRunning():
+            # E1: switching tiers mid-inference would double-load a model
+            # without freeing the old one — the running generator still pins it.
+            self.status.showMessage("AI busy — wait for it to finish (Esc to cancel)")
+            self._speak("The AI is busy. Wait for it to finish, or press Escape to cancel.")
             return
         if self.ai.is_loaded():
             self.ai.unload()
@@ -615,6 +866,7 @@ class MainWindow(QMainWindow):
         self.ai_loader.progress.connect(self._ai_load_progress)
         self.ai_loader.done.connect(self._ai_loaded)
         self.ai_loader.failed.connect(self._ai_failed)
+        self.ai_loader.cancelled.connect(self._on_load_cancelled)
         self.ai_progress.setVisible(True)
         self.ai_progress_lbl.setVisible(True)
         self.ai_progress.setRange(0, 0)
@@ -623,6 +875,10 @@ class MainWindow(QMainWindow):
         self.ai_loader.start()
 
     def _unload_ai(self):
+        if self.ai_infer and self.ai_infer.isRunning():
+            # E1: freeing the model under an active generator would crash it.
+            self.status.showMessage("AI busy — wait for it to finish (Esc to cancel)")
+            return
         self.ai.unload()
         self.model_label.setText("AI: idle")
         self.model_label.setStyleSheet(
@@ -670,6 +926,16 @@ class MainWindow(QMainWindow):
             "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }")
         self.status.showMessage(f"AI error: {msg}")
 
+    def _on_load_cancelled(self):
+        """A model download/load was cancelled mid-flight (E4)."""
+        self.ai_progress.setVisible(False)
+        self.ai_progress_lbl.setVisible(False)
+        self.model_label.setText("AI: idle")
+        self.model_label.setStyleSheet(
+            "QPushButton { background: #2a2a2a; color: #aaa; border: 1px solid #444; "
+            "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }")
+        self.status.showMessage("AI load cancelled")
+
     def _ai_ask(self):
         q, ok = QInputDialog.getText(self, "Ask AI", "Question:")
         if not ok or not q:
@@ -685,6 +951,7 @@ class MainWindow(QMainWindow):
     def _run_ai(self, command, **kwargs):
         if not self.ai.is_loaded():
             self.status.showMessage("Load AI model first (toolbar → AI)")
+            self._speak("Load an AI model first. Use the AI button in the toolbar.")
             return
         if self.ai_infer and self.ai_infer.isRunning():
             self.status.showMessage("AI busy — press Esc to cancel")
@@ -695,8 +962,10 @@ class MainWindow(QMainWindow):
         self.ai_infer.token.connect(self.notes_panel.stream_token)
         self.ai_infer.image_request.connect(self._render_rag_images)
         self.ai_infer.finished_ok.connect(self._on_infer_done)
+        self.ai_infer.cancelled.connect(self._on_infer_cancelled)
         self.ai_infer.failed.connect(self._ai_failed)
         self.ai_infer.start()
+        self._esc_target = "ai"
         self.status.showMessage(f"AI: {command.replace('_', ' ')}…  (Esc to cancel)")
 
     def _render_rag_images(self, image_chunks):
@@ -725,9 +994,25 @@ class MainWindow(QMainWindow):
             self.notes_panel.append_markdown("\n\n---\n\n" + "\n\n".join(self._rag_images))
             self._rag_images = []
 
+    def _on_infer_cancelled(self, heading=None):
+        """A run was cancelled mid-stream (E6) — mark the partial answer so it
+        isn't mistaken for a complete one."""
+        self.notes_panel.stream_end()
+        self.notes_panel.append_markdown(
+            "\n\n> ✂️ _Cancelled — answer may be incomplete_")
+        self._rag_images = []
+        self.status.showMessage("AI: cancelled")
+
     def _cancel_ai(self):
-        self.ai.request_cancel()
-        self.status.showMessage("AI: cancelling…")
+        if self._esc_target == "ai":
+            self._esc_target = None
+        if self.ai_loader and self.ai_loader.isRunning():
+            # E4: a stalled/hung model download can now be cancelled.
+            self.ai.request_cancel()
+            self.status.showMessage("AI: cancelling download…")
+        elif self.ai_infer and self.ai_infer.isRunning():
+            self.ai.request_cancel()
+            self.status.showMessage("AI: cancelling…")
 
     # ── Accessibility (TTS + narrator) ─────────────────────────────────────
     def toggle_a11y(self, checked=None):
@@ -739,6 +1024,9 @@ class MainWindow(QMainWindow):
             self._a11y_on()
         elif not checked and self._a11y_mode:
             self._a11y_off()
+        # Keep the toolbar 🎧 button's visual state honest when toggled via
+        # the keyboard shortcut (A5).
+        self.a11y_toggle_btn.setChecked(self._a11y_mode)
 
     def _a11y_on(self):
         self._a11y_mode = True
@@ -759,11 +1047,19 @@ class MainWindow(QMainWindow):
             self.status.showMessage("Accessibility: TTS voice still loading…")
             return
         self.status.showMessage("Accessibility: downloading/loading TTS voice…")
+        self._voice_progress.setVisible(True)   # H2
         self._voice_loader = VoiceLoadWorker(self)
         self._voice_loader.status.connect(self._on_voice_status)
         self._voice_loader.done.connect(self._on_voice_ready)
         self._voice_loader.failed.connect(self._on_voice_failed)
         self._voice_loader.start()
+
+    def _speak(self, text):
+        """Speak a status/confirmation message when accessibility is active
+        (A4) — blind users get no visual status bar, so gated errors and
+        mode changes must be audible."""
+        if self._a11y_mode and self._speech_queue:
+            self._speech_queue.enqueue(text)
 
     def _on_voice_status(self, msg):
         self.status.showMessage(f"TTS: {msg}")
@@ -785,16 +1081,29 @@ class MainWindow(QMainWindow):
         self._speech_queue = SpeechQueue(self._speech_engine, self)
         self._speech_queue.chunk_started.connect(
             lambda t: self.status.showMessage(f"🔊 {t[:60]}"))
+        self._speech_queue.position_started.connect(self._on_position_played)
+        self._speech_queue.page_end.connect(self._on_page_played_to_end)
         self._speech_queue.start()
         self._voice_loader = None
+        self._voice_progress.setVisible(False)   # H2
+        self._speech_queue.enqueue(
+            "Accessibility mode on. Press R to read the current page, "
+            "C to continue, question mark for help.")
+        # A7: first time accessibility is ever enabled, read the full shortcut
+        # list aloud so the feature is discoverable without a screen reader.
+        if not a11y_onboarded():
+            mark_a11y_onboarded()
+            self._speech_queue.enqueue(_keybinds_text())
         self.status.showMessage(
             "Accessibility mode on — press R to read, C to continue, ? for help")
 
     def _on_voice_failed(self, msg):
         self._voice_loader = None
+        self._voice_progress.setVisible(False)   # H2
         self.status.showMessage(f"TTS unavailable: {msg}")
         self._a11y_mode = False
         self.a11y_bar.setVisible(False)
+        self.a11y_toggle_btn.setChecked(False)
 
     def _a11y_off(self):
         self._a11y_mode = False
@@ -803,11 +1112,18 @@ class MainWindow(QMainWindow):
             self._narrator_worker.cancel()
             self._narrator_worker = None
         if self._speech_queue:
-            self._speech_queue.stop()
+            # Speak the "off" confirmation on the way out, then drain & stop.
+            # wait() blocks the main thread for the ~2s farewell so the engine
+            # isn't torn down mid-sentence.
+            self._speech_queue.cancel()
+            self._speech_queue.enqueue("Accessibility mode off")
+            self._speech_queue.flush_and_stop()
+            self._speech_queue.wait(8000)
             self._speech_queue = None
         if self._speech_engine:
             self._speech_engine.shutdown()
             self._speech_engine = None
+        self._esc_target = None
         self.status.showMessage("Accessibility mode off")
 
     def _narrator(self):
@@ -830,12 +1146,7 @@ class MainWindow(QMainWindow):
         if not self._speech_queue:
             self.status.showMessage("TTS voice still loading…")
             return
-        if not self.ai.is_loaded():
-            self.status.showMessage("Load an AI model first (AI menu)")
-            return
-        if not self.rag_index or not self.rag_index.is_ready:
-            self.status.showMessage("Indexing in progress — wait for index ready")
-            return
+        self._esc_target = "narration"
         # Starting fresh from the top — reset the pause button label.
         self.a11y_play_btn.setChecked(False)
         self.a11y_play_btn.setText("⏸ Pause")
@@ -849,12 +1160,7 @@ class MainWindow(QMainWindow):
         if not self._speech_queue:
             self.status.showMessage("TTS voice still loading…")
             return
-        if not self.ai.is_loaded():
-            self.status.showMessage("Load an AI model first (AI menu)")
-            return
-        if not self.rag_index or not self.rag_index.is_ready:
-            self.status.showMessage("Indexing in progress — wait for index ready")
-            return
+        self._esc_target = "narration"
         page, chunk = self._resume_pos or (self.current_page, 0)
         if self.engine.doc and 0 <= page < self.engine.page_count:
             self.go_to_page(page)
@@ -915,15 +1221,29 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Narration volume: {value}%")
 
     def _on_narrator_chunk_progress(self, page, chunk):
-        """Persist the live narration position so 'Continue reading' works
-        across sessions and after a manual stop."""
+        """Track where narration currently is (in memory, for 'Continue' within
+        a session). The disk-persisted copy is written by _on_position_played
+        only when a chunk actually starts playing, so a mid-read stop never
+        saves a resume point ahead of what the user heard (A2)."""
+        self._resume_pos = (page, chunk)
+
+    def _on_position_played(self, page, chunk):
+        """A chunk actually began playing — safe to persist this resume point."""
+        self._resume_pos = (page, chunk)
         if self.storage:
-            self._resume_pos = (page, chunk)
             self.storage.save_narration_position(page, chunk)
 
     def _on_narrator_page_done(self, page):
-        """When a page finishes naturally, advance the resume pointer to
-        the top of the next page so 'Continue' doesn't replay this one."""
+        """The narrator finished enqueueing this page. Resume advancement
+        happens in _on_page_played_to_end once playback actually completes."""
+        pass
+
+    def _on_page_played_to_end(self, page):
+        """The page's narration finished playing (SpeechQueue reached the end
+        marker) — advance the resume pointer to the top of the next page so
+        'Continue' doesn't replay this one."""
+        if self._esc_target == "narration":
+            self._esc_target = None
         if self.storage and self.engine.doc:
             nxt = min(page + 1, self.engine.page_count - 1)
             self._resume_pos = (nxt, 0)
@@ -931,6 +1251,13 @@ class MainWindow(QMainWindow):
 
     def _stop_narration(self):
         """Stop all narration and clear the TTS queue."""
+        if self._esc_target == "narration":
+            self._esc_target = None
+        if self._narrator_worker:
+            # Cancel the narrator thread too, not just the queue — otherwise a
+            # stop during a slow image-description call would resume enqueueing.
+            self._narrator_worker.cancel()
+            self._narrator_worker = None
         if self._speech_queue:
             self._speech_queue.cancel()
         self.a11y_play_btn.setChecked(False)
@@ -945,6 +1272,7 @@ class MainWindow(QMainWindow):
         bbox = page.next_image()
         if bbox is None:
             self.status.showMessage("No more images on this page")
+            self._speak("No more images on this page.")
             return
         self._describe_image_at(page.page_idx, bbox)
 
@@ -952,9 +1280,17 @@ class MainWindow(QMainWindow):
         """Describe an image at the given page/bbox. Uses cache if available."""
         if not self.ai.is_loaded():
             self.status.showMessage("Load an AI model first (AI menu)")
+            self._speak("Load an AI model first. Use the AI button in the toolbar.")
             return
         if not self.ai.is_multimodal():
             self.status.showMessage("Current model is text-only — switch to Gemma 4 for vision")
+            self._speak("The current model is text only. Switch to a Gemma 4 model for vision.")
+            return
+        if getattr(self, "_img_worker", None) and self._img_worker.isRunning():
+            # E2: one vision call at a time — a second one would pile onto the
+            # same model object (and, without the AILayer lock, race narration).
+            self.status.showMessage("Another image description is running — wait for it")
+            self._speak("An image description is already running.")
             return
         cached = self.storage.get_image_description(page_idx, bbox)
         if cached:
@@ -1009,10 +1345,45 @@ class MainWindow(QMainWindow):
         if not self._speech_queue:
             self.status.showMessage("TTS voice still loading…")
             return
+        self._esc_target = "narration"
         text = self.notes_panel.get_plain_text()
         if text.strip():
             self._speech_queue.enqueue(text)
             self.status.showMessage("Reading notes…")
+
+    def _export_page_wav(self):
+        """Export the current page's narration as a standalone WAV file (A10).
+        Piper-only — pyttsx3 has no offline render path."""
+        if not self._a11y_mode:
+            self.toggle_a11y(True)
+        if not self._speech_engine:
+            self.status.showMessage("TTS voice still loading…")
+            self._speak("The TTS voice is still loading.")
+            return
+        if not self.engine.doc or self.current_page >= self.engine.page_count:
+            return
+        text = self.engine.extract_page_text(self.current_page)
+        if not text.strip():
+            self.status.showMessage("No text on this page to export")
+            self._speak("No text on this page to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Page Narration as WAV",
+            f"page_{self.current_page + 1}.wav", "WAV Audio (*.wav)")
+        if not path:
+            return
+        if not path.lower().endswith(".wav"):
+            path += ".wav"
+        self._speak(f"Rendering page {self.current_page + 1} to audio.")
+        worker = WavExportWorker(self._speech_engine, text, path, self)
+        worker.done.connect(
+            lambda p: (self.status.showMessage(f"Audio saved: {p}"),
+                       self._speak("Audio saved.")))
+        worker.failed.connect(
+            lambda m: (self.status.showMessage(f"WAV export failed: {m}"),
+                       self._speak("Audio export failed.")))
+        self._wav_worker = worker
+        worker.start()
 
     def _show_a11y_help(self):
         """Open the Accessibility Help window and read it aloud."""
@@ -1056,16 +1427,55 @@ class MainWindow(QMainWindow):
             self._speech_queue.enqueue(_keybinds_text())
         self.status.showMessage("Accessibility help")
 
+    def _scroll_document(self, event):
+        """Route arrow / PageUp / Home / End keys to the document scroll
+        area (F3) — the scroll bar is the only scrollable thing in the
+        viewer and these keys were previously unreachable."""
+        sb = self.scroll.verticalScrollBar()
+        if event.key() == Qt.Key.Key_Up:
+            sb.setValue(sb.value() - 80)
+        elif event.key() == Qt.Key.Key_Down:
+            sb.setValue(sb.value() + 80)
+        elif event.key() == Qt.Key.Key_PageUp:
+            sb.setValue(sb.value() - max(1, sb.pageStep()))
+        elif event.key() == Qt.Key.Key_PageDown:
+            sb.setValue(sb.value() + max(1, sb.pageStep()))
+        elif event.key() == Qt.Key.Key_Home:
+            sb.setValue(sb.minimum())
+        elif event.key() == Qt.Key.Key_End:
+            sb.setValue(sb.maximum())
+        event.accept()
+
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key.Key_Escape:
             if self.capture_mode:
                 self.cancel_capture()
-            elif self._a11y_mode and self._speech_engine and self._speech_engine.is_speaking():
+            elif (self._esc_target == "ai"
+                    and ((self.ai_infer and self.ai_infer.isRunning())
+                         or (self.ai_loader and self.ai_loader.isRunning()))):
+                # A3: if the user last started an AI run, Esc cancels it first —
+                # no longer requires two presses when narration is also running.
+                self._cancel_ai()
+            elif (self._esc_target == "narration" and self._a11y_mode
+                    and self._speech_engine
+                    and (self._speech_engine.is_speaking()
+                         or (self._speech_queue and self._speech_queue.pending > 0))):
                 self._stop_narration()
             elif self.ai_infer and self.ai_infer.isRunning():
                 self._cancel_ai()
+            elif self.ai_loader and self.ai_loader.isRunning():
+                self._cancel_ai()
+            elif self._a11y_mode and self._speech_engine and self._speech_engine.is_speaking():
+                self._stop_narration()
             else:
                 self.clear_search()
+            return
+        # Document-view keyboard scrolling (F3) — a PageView is focusable, so
+        # arrow/PageUp/Home/End reach this handler instead of dying on the
+        # unfocused scroll area.
+        if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_PageUp,
+                           Qt.Key.Key_PageDown, Qt.Key.Key_Home, Qt.Key.Key_End):
+            self._scroll_document(event)
             return
         # Accessibility shortcuts (no modifiers needed)
         if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._a11y_mode:
@@ -1118,7 +1528,10 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.fit_width and self.pages:
-            self._apply_zoom()
+            # F5: during a live resize drag only re-render what's visible; a
+            # debounced full pass catches off-screen pages once the drag stops.
+            self._apply_zoom(render_visible_only=True)
+            self._resize_timer.start(200)
 
     def closeEvent(self, event):
         # Stop accessibility workers first (TTS + narrator + voice loader).
@@ -1176,6 +1589,28 @@ def _install_excephook():
     sys.excepthook = hook
 
 
+def _apply_app_palette(app, high_contrast=False):
+    """Dark (or high-contrast black/white) palette for the whole app (A11)."""
+    p = app.palette()
+    if high_contrast:
+        p.setColor(p.ColorRole.Window, QColor(0, 0, 0))
+        p.setColor(p.ColorRole.WindowText, QColor(255, 255, 255))
+        p.setColor(p.ColorRole.Base, QColor(255, 255, 255))
+        p.setColor(p.ColorRole.AlternateBase, QColor(220, 220, 220))
+        p.setColor(p.ColorRole.Text, QColor(0, 0, 0))
+        p.setColor(p.ColorRole.Button, QColor(0, 0, 0))
+        p.setColor(p.ColorRole.ButtonText, QColor(255, 255, 255))
+    else:
+        p.setColor(p.ColorRole.Window, QColor(18, 18, 18))
+        p.setColor(p.ColorRole.WindowText, QColor(238, 238, 238))
+        p.setColor(p.ColorRole.Base, QColor(30, 30, 30))
+        p.setColor(p.ColorRole.AlternateBase, QColor(40, 40, 40))
+        p.setColor(p.ColorRole.Text, QColor(238, 238, 238))
+        p.setColor(p.ColorRole.Button, QColor(50, 50, 50))
+        p.setColor(p.ColorRole.ButtonText, QColor(238, 238, 238))
+    app.setPalette(p)
+
+
 def main():
     # Lean AI logging to ai.log (rotates at 1 MB, keeps 1 backup).
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -1188,18 +1623,24 @@ def main():
             str(log_dir / "ai.log"), maxBytes=1_000_000, backupCount=1)],
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    # E3: on NVIDIA machines whose bundled llama-cpp-python wheel is CPU-only,
+    # download the CUDA-built libllama and restart so the native lib loads at
+    # import time. If the restart can't be done (e.g. non-POSIX), fall through
+    # to CPU rather than refusing to start.
+    try:
+        from .ai_layer import ensure_gpu_native
+        if ensure_gpu_native():
+            print("Installed CUDA build of llama — restarting to activate…")
+            try:
+                os.execv(sys.executable, [sys.executable, *sys.argv])
+            except Exception:
+                logging.getLogger("pyxis").warning("auto-restart failed; continuing on CPU")
+    except Exception as e:
+        logging.getLogger("pyxis").warning("GPU native setup failed: %s", e)
     app = QApplication(sys.argv)
     _install_excephook()  # F2: contain uncaught exceptions instead of SIGABRT
     app.setStyle("Fusion")
-    palette = app.palette()
-    palette.setColor(palette.ColorRole.Window, QColor(18, 18, 18))
-    palette.setColor(palette.ColorRole.WindowText, QColor(238, 238, 238))
-    palette.setColor(palette.ColorRole.Base, QColor(30, 30, 30))
-    palette.setColor(palette.ColorRole.AlternateBase, QColor(40, 40, 40))
-    palette.setColor(palette.ColorRole.Text, QColor(238, 238, 238))
-    palette.setColor(palette.ColorRole.Button, QColor(50, 50, 50))
-    palette.setColor(palette.ColorRole.ButtonText, QColor(238, 238, 238))
-    app.setPalette(palette)
+    _apply_app_palette(app)
     path = sys.argv[1] if len(sys.argv) > 1 else None
     window = MainWindow(path)
     window.show()

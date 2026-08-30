@@ -1,8 +1,11 @@
 import re
 import gc
+import sys
 import base64
 import logging
 import platform
+import threading
+from pathlib import Path
 
 log = logging.getLogger("ai_layer")
 
@@ -101,7 +104,6 @@ def ensure_gpu_native(on_status=None):
 
     Returns True if the app should restart to pick up the new library.
     The caller (``main.py``) is responsible for actually restarting."""
-    import sys
     if sys.platform == "darwin":
         return False   # Metal is built into the default wheel; no swap needed
     try:
@@ -296,12 +298,17 @@ class AILayer:
         self.accel = "cpu"
         self._cancel = False
         self._handler = None      # Gemma4ChatHandler (vision), or None for text-only tiers
+        # E2: llama.cpp is not safe for concurrent create_chat_completion calls.
+        # Narration (describe_image), AI-ask, and expand_query can all hit the
+        # same model object; this lock serializes them.
+        self._infer_lock = threading.Lock()
 
     def is_multimodal(self):
         return bool(self.tier and self.tier.get("multimodal") and self._handler)
 
     # ── loading ────────────────────────────────────────────────────────────
     def load_model(self, on_status=None, on_progress=None, repo_id=None, filename=None, tier_idx=None):
+        self.reset_cancel()   # E4: don't inherit a stale cancel from a prior run
         ram, self.accel = detect_capacity()
         log.info("capacity: %.1f GB, accel=%s", ram, self.accel)
         if on_status:
@@ -397,6 +404,8 @@ class AILayer:
         _SignalTqdm._callback = on_progress
         try:
             for i, fn in enumerate(files, 1):
+                if self._cancel:   # E4: cooperative cancel for stalled downloads
+                    raise RuntimeError("Download cancelled")
                 if on_status:
                     on_status(f"Downloading {fn} ({i}/{len(files)})…")
                 hf_hub_download(
@@ -450,10 +459,11 @@ class AILayer:
                   f"Include the original words plus 2-3 synonyms. No prose.\n\n"
                   f"QUERY: {question}\nOUTPUT:")
         try:
-            resp = self.llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=80, stream=False, temperature=0.3,
-            )
+            with self._infer_lock:   # E2
+                resp = self.llm.create_chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=80, stream=False, temperature=0.3,
+                )
             return resp["choices"][0]["message"]["content"].strip()
         except Exception:
             return question
@@ -516,16 +526,19 @@ class AILayer:
         # asks for thinking, omit it otherwise. Non-Gemma models ignore the
         # token harmlessly.
         msgs = self._with_thinking(messages, enable_thinking)
-        stream = self.llm.create_chat_completion(
-            messages=msgs, stream=True, max_tokens=MAX_TOKENS
-        )
-        for chunk in stream:
-            if self._cancel:
-                break
-            delta = chunk["choices"][0].get("delta", {})
-            token = delta.get("content")
-            if token and on_token:
-                on_token(token)
+        # Hold the inference lock for the whole stream (E2) so narration's
+        # describe_image and any other inference never hit llama concurrently.
+        with self._infer_lock:
+            stream = self.llm.create_chat_completion(
+                messages=msgs, stream=True, max_tokens=MAX_TOKENS
+            )
+            for chunk in stream:
+                if self._cancel:
+                    break
+                delta = chunk["choices"][0].get("delta", {})
+                token = delta.get("content")
+                if token and on_token:
+                    on_token(token)
 
     @staticmethod
     def _with_thinking(messages, enable_thinking):
@@ -568,7 +581,8 @@ class AILayer:
         if enable_thinking:
             messages = [{"role": "system", "content": "<|think|>\nYou are a vision assistant."}] + messages
         log.info("describe_image: %d bytes, thinking=%s", len(image_bytes), enable_thinking)
-        resp = self.llm.create_chat_completion(
-            messages=messages, stream=False, max_tokens=MAX_IMG_TOKENS,
-        )
+        with self._infer_lock:   # E2: serialize with other llama calls
+            resp = self.llm.create_chat_completion(
+                messages=messages, stream=False, max_tokens=MAX_IMG_TOKENS,
+            )
         return resp["choices"][0]["message"]["content"].strip()

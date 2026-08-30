@@ -2,6 +2,12 @@ import re
 from rank_bm25 import BM25Okapi
 from rapidfuzz import fuzz
 
+# E5: the context budget is a *token* estimate (chars/4 is a safe upper bound
+# for typical English/markdown), sized to stay inside the model's N_CTX=8192
+# window after MAX_TOKENS=700 of answer. A pure character budget silently
+# overflows on token-dense content (tables, code, non-Latin text).
+CONTEXT_TOKEN_BUDGET = 6000
+
 
 def tokenize(text):
     return re.findall(r'\b\w+\b', text.lower())
@@ -69,7 +75,7 @@ class RagIndex:
         reranked = sorted(candidates, key=blend, reverse=True)
         return [self.chunks[i] for i in reranked[:top_k]]
 
-    def assemble_context(self, chunks, budget=12000):
+    def assemble_context(self, chunks, budget_tokens=CONTEXT_TOKEN_BUDGET):
         parts, total, images, pages = [], 0, [], set()
         for c in chunks:
             tag = f"[Page {c['page']+1}"
@@ -80,18 +86,21 @@ class RagIndex:
                 images.append(c)
             else:
                 tag += ", paragraph]"
-            text = c["text"][:budget // 4]
+            # Per-chunk cap (a single chunk must never blow the whole budget).
+            text = c["text"][:budget_tokens * 4]
             block = f"{tag}\n{text}"
-            if total + len(block) > budget:
+            block_tokens = len(block) // 4
+            if total + block_tokens > budget_tokens:
                 break
             parts.append(block)
-            total += len(block)
+            total += block_tokens
             pages.add(c["page"])
-        if pages and budget - total > 500:
+        if pages and budget_tokens - total > 125:
             top_page = sorted(pages)[0]
             full = self.page_texts[top_page]
-            if len(full) > budget - total:
-                full = full[:budget - total] + " [...]"
+            room = (budget_tokens - total) * 4 - len(" [...]")
+            if len(full) > room:
+                full = full[:room] + " [...]"
             parts.append(f"[Page {top_page+1} — full page text]\n{full}")
         return "\n\n---\n\n".join(parts), images
 

@@ -75,20 +75,23 @@ class NarratorWorker(QThread):
         self.page_started.emit(page_idx)
         log.info("narrating page %d (from chunk %d)", page_idx, start_chunk)
 
-        # Gather chunks for this page in source order.
-        chunks = [c for c in self.rag.chunks if c["page"] == page_idx]
+        # Gather chunks for this page in source order. `rag` may be None (A8:
+        # narration must work before the index is built / model is loaded).
+        chunks = [c for c in self.rag.chunks if c["page"] == page_idx] \
+            if self.rag is not None else []
         if start_chunk > 0 and chunks:
             chunks = chunks[start_chunk:]
         if not chunks:
-            # No RAG chunks (or we skipped them all) — read raw page text as
-            # fallback, but only when starting from the top.
-            if start_chunk == 0:
+            # No RAG chunks (or none available) — read raw page text as
+            # fallback. Without an index we can't honor start_chunk, so a
+            # "continue" with no RAG falls back to the top of the page.
+            if start_chunk == 0 or self.rag is None:
                 doc = fitz.open(self.engine.path)
                 text = doc.load_page(page_idx).get_text()
                 doc.close()
                 if text.strip():
                     self.chunk_progress.emit(page_idx, 0)
-                    self.speech.enqueue(text)
+                    self.speech.enqueue(text, (page_idx, 0))
                     self.chunk_queued.emit(text[:80])
         else:
             doc = fitz.open(self.engine.path)
@@ -100,16 +103,22 @@ class NarratorWorker(QThread):
                 abs_idx = start_chunk + i
                 self.chunk_progress.emit(page_idx, abs_idx)
                 if c["type"] == "image":
-                    self._describe_and_enqueue(doc, page_idx, c)
+                    self._describe_and_enqueue(doc, page_idx, c, abs_idx)
                 else:
                     text = c["text"]
-                    self.speech.enqueue(text)
+                    self.speech.enqueue(text, (page_idx, abs_idx))
                     self.chunk_queued.emit(text[:80])
             doc.close()
 
+        # A2: mark the end of this page's narration. The queue speaks the end
+        # marker only after every chunk queued before it has finished, so the
+        # UI can safely advance the resume pointer — it never races ahead of
+        # what the user actually heard. Skipped when narration was cancelled.
+        if self._running:
+            self.speech.enqueue_end(page_idx)
         self.page_done.emit(page_idx)
 
-    def _describe_and_enqueue(self, doc, page_idx, chunk):
+    def _describe_and_enqueue(self, doc, page_idx, chunk, abs_idx):
         """Describe an image chunk: check cache, else call vision model."""
         bbox = chunk.get("image_rect")
         if not bbox:
@@ -121,7 +130,8 @@ class NarratorWorker(QThread):
             desc = cached["description"]
             log.info("using cached image description for page %d", page_idx)
             self._emit_caption(page_idx, desc, cached.get("file", ""))
-            self.speech.enqueue(f"Image on page {page_idx + 1}. {desc}")
+            self.speech.enqueue(f"Image on page {page_idx + 1}. {desc}",
+                                (page_idx, abs_idx))
             return
 
         # Extract the image region as PNG bytes.
@@ -135,7 +145,8 @@ class NarratorWorker(QThread):
             log.warning("image extraction failed (page %d): %s", page_idx, e)
             return
 
-        # Call the vision model.
+        # Call the vision model. `ai` may be unloaded (A8) — degrade to a
+        # placeholder caption instead of failing the whole narration.
         if not self.ai.is_multimodal():
             desc = "Image present but vision model not loaded."
         else:
@@ -153,7 +164,8 @@ class NarratorWorker(QThread):
         self._emit_caption(page_idx, desc,
                            str(img_path.relative_to(self.storage.folder))
                            if img_path else "")
-        self.speech.enqueue(f"Image on page {page_idx + 1}. {desc}")
+        self.speech.enqueue(f"Image on page {page_idx + 1}. {desc}",
+                            (page_idx, abs_idx))
 
     def _emit_caption(self, page_idx, desc, rel_path):
         """Build markdown for the caption and emit it for notes panel."""

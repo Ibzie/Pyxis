@@ -6,6 +6,11 @@ ZOOM_LEVELS = [0.25, 0.33, 0.5, 0.67, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]
 MAX_CACHE = 50
 
 
+class PasswordRequired(Exception):
+    """Raised by PdfEngine.open when a PDF is encrypted and no valid
+    password was supplied (G5) — the UI prompts and retries."""
+
+
 class PdfEngine:
     def __init__(self):
         self.doc = None
@@ -17,9 +22,16 @@ class PdfEngine:
         self.cache = OrderedDict()
         self.page_sizes = []
 
-    def open(self, path):
+    def open(self, path, password=None):
         self.close()
-        self.doc = fitz.open(path)
+        doc = fitz.open(path)
+        if doc.needs_pass:
+            if password and doc.authenticate(password):
+                pass
+            else:
+                doc.close()
+                raise PasswordRequired(path)
+        self.doc = doc
         self.path = path
         self.page_count = len(self.doc)
         self.metadata = self.doc.metadata or {}
@@ -72,13 +84,13 @@ class PdfEngine:
         page = self.doc.load_page(idx)
         zoom = target_width / self.page_sizes[idx][0]
         mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        if pix.n == 4:
-            fmt = QImage.Format.Format_RGBA8888
-        elif pix.n == 3:
-            fmt = QImage.Format.Format_RGB888
-        else:
-            fmt = QImage.Format.Format_RGBA8888
+        # Force an RGB(A) colorspace so `pix.n` always matches the QImage
+        # buffer format (F7) — a grayscale page would otherwise be mis-decode
+        # as RGBA8888 and show garbage.
+        pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+        if pix.n not in (3, 4):
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        fmt = QImage.Format.Format_RGBA8888 if pix.n == 4 else QImage.Format.Format_RGB888
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
         self.cache[key] = img
         if len(self.cache) > MAX_CACHE:
@@ -107,12 +119,14 @@ class PdfEngine:
         return chars
 
     def search(self, query):
+        """Return every match as (page_idx, bbox) where bbox is
+        (x0, y0, x1, y1) in PDF points — one entry per in-page hit so the
+        "1/N" counter reflects real matches and pages can be highlighted."""
         if not query or not self.doc:
             return []
-        q = query.lower()
-        found = []
+        hits = []
         for i in range(self.page_count):
-            text = self.extract_page_text(i).lower()
-            if q in text:
-                found.append(i)
-        return found
+            page = self.doc.load_page(i)
+            for r in page.search_for(query):
+                hits.append((i, (r.x0, r.y0, r.x1, r.y1)))
+        return hits

@@ -31,6 +31,22 @@ VOICE_CONFIG = "en_US-lessac-medium.onnx.json"
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
+class _EndMarker:
+    """Silent sentinel queued after a narrated page's chunks. The SpeechQueue
+    never speaks it; when reached, it means every chunk queued before it has
+    finished playing, so the resume pointer may safely advance (A2)."""
+    __slots__ = ("page",)
+
+    def __init__(self, page):
+        self.page = page
+
+
+class _StopMarker:
+    """Sentinel that drains remaining text then stops the queue thread
+    (used to speak a farewell before teardown)."""
+    __slots__ = ()
+
+
 def split_sentences(text):
     """Split text into speakable chunks. Merges very short fragments and
     breaks very long sentences at commas so Piper gets natural-sized chunks."""
@@ -152,6 +168,29 @@ class PiperEngine:
     def is_speaking(self):
         return self._speaking
 
+    def render_wav(self, text, path):
+        """Synthesize `text` to a WAV file without playing it (A10). The
+        frames Piper already produces per sentence are written straight to a
+        wave file, so exports match exactly what live playback sounds like."""
+        if not self._voice:
+            raise RuntimeError("No TTS voice loaded")
+        import wave
+        if not text.strip():
+            raise RuntimeError("Nothing to render")
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self._sample_rate)
+            if _HAS_SYNTH_CONFIG:
+                cfg = _SynthesisConfig(length_scale=self._length_scale,
+                                       volume=self._volume)
+                chunks = list(self._voice.synthesize(text, cfg))
+            else:
+                chunks = list(self._voice.synthesize(text))
+            for c in chunks:
+                wf.writeframes(c.audio_int16_bytes)
+        return path
+
     def shutdown(self):
         self.cancel()
         if self._voice is not None:
@@ -173,6 +212,7 @@ class Pyttsx3Engine:
         self._engine.setProperty("rate", 180)
         self._engine.setProperty("volume", 1.0)
         self._rate_mult = 1.0
+        self._speaking = False
 
     def set_rate(self, speed):
         speed = max(0.25, min(speed, 4.0))
@@ -185,17 +225,24 @@ class Pyttsx3Engine:
     def speak(self, text):
         if not text.strip():
             return
-        self._engine.say(text)
-        self._engine.runAndWait()
+        self._speaking = True
+        try:
+            self._engine.say(text)
+            self._engine.runAndWait()
+        finally:
+            self._speaking = False
 
     def cancel(self):
         try:
             self._engine.stop()
         except Exception:
             pass
+        self._speaking = False
 
     def is_speaking(self):
-        return False
+        # A3: was hardcoded `return False`, which made Escape's stop-narration
+        # unreachable on the pyttsx3 fallback engine.
+        return self._speaking
 
     def shutdown(self):
         self.cancel()
@@ -240,6 +287,30 @@ class VoiceLoadWorker(QThread):
             self.failed.emit(str(e))
 
 
+class WavExportWorker(QThread):
+    """Render text to a WAV file off the GUI thread (A10). Piper-only —
+    pyttsx3 has no offline render-to-file path."""
+    done = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, engine, text, path, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.text = text
+        self.path = path
+
+    def run(self):
+        try:
+            if not hasattr(self.engine, "render_wav"):
+                raise RuntimeError(
+                    "WAV export needs the Piper voice (pyttsx3 cannot render files)")
+            self.engine.render_wav(self.text, self.path)
+            self.done.emit(self.path)
+        except Exception as e:
+            log.error("wav export failed: %s", e)
+            self.failed.emit(str(e))
+
+
 class SpeechQueue(QThread):
     """Background thread that speaks enqueued text chunks sequentially.
 
@@ -248,6 +319,11 @@ class SpeechQueue(QThread):
         chunk_done()        — fired after each chunk finishes
         queue_empty()        — fired when the queue drains completely
         failed(str)         — fired on engine errors
+        position_started(int, int) — (page, chunk) meta tag of a chunk that
+                                     actually began playing (A2: persist only
+                                     what was really heard)
+        page_end(int)       — an _EndMarker was reached, so every chunk queued
+                              before it has finished playing
 
     Pause/resume is sentence-grained: pause() cancels the in-flight chunk
     and stashes it; resume() re-queues it so the same sentence replays
@@ -258,6 +334,8 @@ class SpeechQueue(QThread):
     chunk_done = pyqtSignal()
     queue_empty = pyqtSignal()
     failed = pyqtSignal(str)
+    position_started = pyqtSignal(int, int)
+    page_end = pyqtSignal(int)
 
     def __init__(self, engine, parent=None):
         super().__init__(parent)
@@ -270,10 +348,21 @@ class SpeechQueue(QThread):
         self._current = None              # chunk currently being spoken
         self._pending = None              # chunk captured by pause(), awaiting resume
 
-    def enqueue(self, text):
-        """Add text to the speak queue. Splits into sentence-grained chunks."""
+    def enqueue(self, text, meta=None):
+        """Add text to the speak queue. Splits into sentence-grained chunks.
+        `meta` is an optional (page, chunk) tag emitted via position_started
+        once the chunk actually starts playing."""
         for chunk in split_sentences(text):
-            self._queue.put(chunk)
+            self._queue.put((chunk, meta))
+
+    def enqueue_end(self, page):
+        """Queue a silent page-end marker after the current text (A2)."""
+        self._queue.put(_EndMarker(page))
+
+    def flush_and_stop(self):
+        """Speak everything already queued, then exit the thread. Used to
+        announce "Accessibility mode off" before the engine is torn down."""
+        self._queue.put(_StopMarker())
 
     def pause(self):
         """Pause playback. Cancels the in-flight sentence and stashes it so
@@ -332,24 +421,33 @@ class SpeechQueue(QThread):
             if not self._running:
                 break
             # Resume-priority chunk first, then the main queue.
-            text = None
+            item = None
             with self._lock:
                 if self._front:
-                    text = self._front.popleft()
-            if text is None:
+                    item = self._front.popleft()
+            if item is None:
                 try:
-                    text = self._queue.get(timeout=0.1)
+                    item = self._queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-            if text is None:
+            if item is None:
+                break  # stop() sentinel
+            if isinstance(item, _EndMarker):
+                self.page_end.emit(item.page)
+                continue
+            if isinstance(item, _StopMarker):
+                self._running = False
                 break
+            text, meta = item
             with self._lock:
-                self._current = text
+                self._current = item
             self.chunk_started.emit(text)
+            if meta is not None:
+                self.position_started.emit(*meta)
             self._engine.speak(text)
             with self._lock:
                 # If pause() captured it, _current is already None — leave it.
-                if self._current is text:
+                if self._current is item:
                     self._current = None
             self.chunk_done.emit()
         self.queue_empty.emit()

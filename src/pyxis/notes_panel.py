@@ -229,6 +229,7 @@ class NotesPanel(QWidget):
         self._focus = None               # index of the block shown raw
         self._base_dir = None
         self._callback = None
+        self._export_extra = None        # optional callable → extra markdown (D1)
         self._render_lock = False        # suppress _on_edit during programmatic builds
         self._stream_heading = None
         self._stream_buffer = ""
@@ -266,6 +267,13 @@ class NotesPanel(QWidget):
     def set_base_dir(self, path):
         self._base_dir = Path(path) if path else None
 
+    def set_ui_scale(self, scale):
+        """Scale the editor font size for low-vision users (A11)."""
+        size = max(9, int(14 * scale))
+        self.editor.setStyleSheet(
+            f"QTextEdit {{ background-color: {BG}; color: #ddd; "
+            f"border: 1px solid #444; padding: 8px; font-size: {size}px; }}")
+
     def set_text(self, text):
         self._source = self._normalize(text)
         self._block_raw = _split_blocks(self._source)
@@ -283,6 +291,12 @@ class NotesPanel(QWidget):
 
     def on_save(self, callback):
         self._callback = callback
+
+    def on_export(self, callback):
+        """Register a callback returning extra markdown to include in the PDF
+        export (D1 — the MainWindow appends the whiteboard tab's content so it
+        isn't silently dropped)."""
+        self._export_extra = callback
 
     def _normalize(self, text):
         lines = [line.rstrip() for line in text.split("\n")]
@@ -506,6 +520,12 @@ class NotesPanel(QWidget):
         # Flush any pending edit so the exported doc matches the live source.
         self._save_timer.stop()
         self._flush_save()
+        # D1: append the other tabs' content (whiteboard) so it isn't dropped.
+        source = self._source
+        if self._export_extra:
+            extra = self._export_extra()
+            if extra:
+                source = source.rstrip() + "\n\n" + extra
         doc = QTextDocument()
         # Readable serif + word wrap that never lets a long line or code
         # token bleed past the page edge (Qt's rich text engine enforces it).
@@ -514,24 +534,23 @@ class NotesPanel(QWidget):
         _to.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         doc.setDefaultTextOption(_to)
         if self._base_dir:
-            for raw in self._block_raw:
-                for m in re.finditer(r'!\[[^\]]*\]\(([^)]+)\)', raw):
-                    p = m.group(1)
-                    if p.startswith(("http", "file:")):
-                        continue
-                    resolved = (self._base_dir / p).resolve()
-                    if not resolved.exists():
-                        continue
-                    pix = QPixmap(str(resolved))
-                    if pix.isNull():
-                        continue
-                    if pix.width() > 480:
-                        pix = pix.scaledToWidth(
-                            480, Qt.TransformationMode.SmoothTransformation)
-                    doc.addResource(
-                        QTextDocument.ResourceType.ImageResource,
-                        QUrl(resolved.as_uri()), pix)
-        doc.setHtml(_export_html(render_markdown_html(self._resolve_full(self._source))))
+            for m in re.finditer(r'!\[[^\]]*\]\(([^)]+)\)', source):
+                p = m.group(1)
+                if p.startswith(("http", "file:")):
+                    continue
+                resolved = (self._base_dir / p).resolve()
+                if not resolved.exists():
+                    continue
+                pix = QPixmap(str(resolved))
+                if pix.isNull():
+                    continue
+                if pix.width() > 480:
+                    pix = pix.scaledToWidth(
+                        480, Qt.TransformationMode.SmoothTransformation)
+                doc.addResource(
+                    QTextDocument.ResourceType.ImageResource,
+                    QUrl(resolved.as_uri()), pix)
+        doc.setHtml(_export_html(render_markdown_html(self._resolve_full(source))))
         printer = QPrinter()
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(path)

@@ -16,6 +16,7 @@ class PageView(QLabel):
         self.zoom = 1.0
         self.chars = []
         self.highlights = []
+        self.search_hits = []
         self.selection = []
         self.drag_start = None
         self.drag_current = None
@@ -26,6 +27,10 @@ class PageView(QLabel):
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("background-color: #1e1e1e;")
+        # F3: pages are focusable so keyboard scrolling (arrows / PageUp /
+        # Home / End) reaches MainWindow.keyPressEvent after a click instead
+        # of dying on the never-focused scroll area.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_image(self, img):
         self.setPixmap(QPixmap.fromImage(img))
@@ -39,6 +44,11 @@ class PageView(QLabel):
 
     def set_highlights(self, highlights):
         self.highlights = highlights
+        self.update()
+
+    def set_search_hits(self, bboxes):
+        """Set the list of search-match bboxes for on-page highlighting (F6)."""
+        self.search_hits = list(bboxes)
         self.update()
 
     def set_image_blocks(self, blocks):
@@ -140,6 +150,10 @@ class PageView(QLabel):
         p.setBrush(QColor(255, 235, 59, 80))
         for hl in self.highlights:
             p.drawRect(self._pdf_to_screen(*hl))
+        # F6: search matches render in orange, distinct from user highlights.
+        p.setBrush(QColor(255, 152, 0, 90))
+        for bbox in self.search_hits:
+            p.drawRect(self._pdf_to_screen(*bbox))
         if self.selection:
             p.setBrush(QColor(33, 150, 243, 80))
             for c in self.selection:
@@ -157,6 +171,8 @@ class PageView(QLabel):
 
     def mousePressEvent(self, ev: QMouseEvent):
         if ev.button() == Qt.MouseButton.LeftButton:
+            # F3: focus the page so keyboard scrolling works after a click.
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
             self.drag_start = self._screen_to_pdf(ev.pos())
             self.drag_current = self.drag_start
             if not self.capture_mode:

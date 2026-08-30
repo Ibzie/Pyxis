@@ -77,6 +77,7 @@ hiddenimports = [
     "pyxis", "pyxis.main", "pyxis.pdf_engine", "pyxis.page_view",
     "pyxis.notes_panel", "pyxis.storage", "pyxis.ai_layer",
     "pyxis.ai_workers", "pyxis.speech", "pyxis.narrator", "pyxis.rag",
+    "pyxis.whiteboard",
     "llama_cpp.llama_chat_format",
     "llama_cpp.llama_chat_format.Gemma4ChatHandler",
     "llama_cpp.llama_chat_format.MTMDChatHandler",

@@ -7,6 +7,7 @@ class LoadWorker(QThread):
     progress = pyqtSignal(int, int, str)
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
 
     def __init__(self, ai, parent=None, tier_idx=None):
         super().__init__(parent)
@@ -25,7 +26,10 @@ class LoadWorker(QThread):
             )
             self.done.emit(self.ai.model_label())
         except Exception as e:
-            self.failed.emit(str(e))
+            if self.ai.cancelled:
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(e))
 
 
 class IndexWorker(QThread):
@@ -59,6 +63,7 @@ class InferWorker(QThread):
     heading = pyqtSignal(str)
     image_request = pyqtSignal(list)   # list of image chunk dicts
     finished_ok = pyqtSignal(str)
+    cancelled = pyqtSignal(str)        # heading (truncated run, E6)
     failed = pyqtSignal(str)
 
     def __init__(self, ai, command, parent=None, **kwargs):
@@ -81,6 +86,11 @@ class InferWorker(QThread):
             messages, heading = self.ai.build_request(self.command, **self.kwargs)
             self.heading.emit(heading)
             self.ai.generate(messages, on_token=lambda t: self.token.emit(t))
-            self.finished_ok.emit(heading)
+            if self.ai.cancelled:
+                # E6: a cancelled run is NOT a successful one — the stream was
+                # truncated mid-token, so it must be surfaced distinctly.
+                self.cancelled.emit(heading)
+            else:
+                self.finished_ok.emit(heading)
         except Exception as e:
             self.failed.emit(str(e))
