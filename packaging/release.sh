@@ -3,17 +3,31 @@ set -euo pipefail
 
 # ── Create a GitHub Release and upload binaries ───────────────────────────
 # Usage: ./packaging/release.sh [version]
-# Default version: 1.0.0
+# Default: the version declared in pyproject.toml
 #
 # Prerequisites:
 #   - GitHub CLI (gh) installed and authenticated: gh auth login
 #   - Build artifacts in dist/ (run build_linux.sh / build_windows.bat first)
 #   - All changes committed and pushed to main
-
-VERSION="${1:-1.0.0}"
-TAG="v${VERSION}"
+#
+# NB: when CI builds on a pushed v* tag, the artifacts are already named
+# after that tag (PYXIS_VERSION) — pass the same version here so the tag,
+# the release title, and the file names all agree.
 
 cd "$(dirname "$0")/.."
+
+if [ -n "${1:-}" ]; then
+    VERSION="$1"
+else
+    VERSION=$(python3 - <<'PYEOF' 2>/dev/null || true
+import re
+m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', open("pyproject.toml").read())
+print(m.group(1) if m else "")
+PYEOF
+)
+    VERSION="${VERSION:-1.0.0}"
+fi
+TAG="v${VERSION}"
 
 # Check gh CLI
 if ! command -v gh &>/dev/null; then
@@ -53,7 +67,7 @@ RELEASE_NOTES="## Pyxis v${VERSION}
 ### Downloads
 - **Linux**: \`Pyxis-${VERSION}-x86_64.AppImage\` — single file, no install needed
   - \`chmod +x Pyxis-${VERSION}-x86_64.AppImage && ./Pyxis-${VERSION}-x86_64.AppImage\`
-- **Windows**: \`Pyxis.exe\` — single portable executable, no install needed
+- **Windows**: \`Pyxis-${VERSION}-x64.exe\` — single portable executable, no install needed
   - Double-click to run
 
 ### Features
@@ -66,7 +80,7 @@ RELEASE_NOTES="## Pyxis v${VERSION}
 
 ### First run
 The app downloads the AI model (~5 GB) and TTS voice (~65 MB) on first use.
-If you have an NVIDIA GPU, it auto-downloads the CUDA build for faster AI.
+For NVIDIA GPU acceleration, install a CUDA-built llama-cpp-python (see README).
 "
 
 gh release create "$TAG" \

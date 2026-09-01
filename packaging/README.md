@@ -10,7 +10,8 @@ Build scripts for Linux (AppImage) and Windows (portable EXE).
 pip install -r requirements.txt
 pip install pyinstaller
 ./packaging/build_linux.sh
-# → dist/Pyxis-1.0.0-x86_64.AppImage
+# → dist/Pyxis-<version>-x86_64.AppImage  (version from pyproject.toml;
+#    override with PYXIS_VERSION=… — CI passes the pushed git tag)
 ```
 Run: `chmod +x dist/Pyxis-*.AppImage && ./dist/Pyxis-*.AppImage`
 
@@ -23,19 +24,28 @@ no root permissions, no dependencies. It mounts via FUSE and runs.
 ```bat
 pip install -r requirements.txt
 pip install pyinstaller
+set PYXIS_VERSION=1.2.3
 packaging\build_windows.bat
-:: → dist\Pyxis.exe
+:: → dist\Pyxis-1.2.3-x64.exe  (without PYXIS_VERSION: dist\Pyxis.exe)
 ```
-Run: Double-click `Pyxis.exe`. No installation needed — it's a single
+Run: Double-click the exe. No installation needed — it's a single
 portable executable. Copy it to any folder (Desktop, Program Files, USB).
+
+### CI release naming
+Pushing a `v*` tag triggers `.github/workflows/build.yml`, which names both
+artifacts after the tag: `Pyxis-<tag>-x86_64.AppImage` and
+`Pyxis-<tag>-x64.exe` (e.g. tag `v1.2.3` → `Pyxis-1.2.3-…`). Local builds
+fall back to the version declared in `pyproject.toml`.
 
 ## GPU acceleration
 
 The packaged app ships with a **CPU-only** `llama-cpp-python` build for
-universality. On first run, if an NVIDIA GPU is detected (Linux/Windows),
-the app downloads a CUDA-built `libllama` shared library (~15 MB) into
-the app's data directory and prompts the user to restart. After restart,
-AI inference uses the GPU automatically.
+universality. To ship GPU builds, install a CUDA-built wheel in the build
+environment before packaging — PyInstaller bundles whatever is installed:
+
+```sh
+CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall llama-cpp-python
+```
 
 ## Data directories
 
@@ -49,7 +59,6 @@ Subdirectories:
 - `notes/<pdf-name>/` — per-PDF notes, highlights, captures, annotations
 - `models/` — HuggingFace model cache (GGUF + mmproj)
 - `voices/` — Piper TTS voice files
-- `native/` — CUDA-built libllama (auto-downloaded)
 - `ai.log` — rotating log file
 
 ## App icon
@@ -78,20 +87,3 @@ Source: `packaging/icons/pyxis.svg`
 |---|---|
 | Linux AppImage | ~200 MB |
 | Windows EXE | ~200 MB |
-
-## CUDA library hosting
-
-The CUDA `libllama` binaries are hosted as HuggingFace assets in the
-`pyxis/native-libs` repo. To build and upload:
-
-```sh
-# Linux CUDA build
-CMAKE_ARGS="-DGGML_CUDA=on" pip install --force-reinstall llama-cpp-python
-python -c "import llama_cpp, pathlib; p=pathlib.Path(llama_cpp.__file__).parent; print(p)"
-# Find libllama.so → rename to libllama-cuda12-linux-x64.so → upload to HF
-
-# Windows CUDA build (on a Windows machine with CUDA Toolkit)
-set CMAKE_ARGS=-DGGML_CUDA=on
-pip install --force-reinstall llama-cpp-python
-# Find llama.dll → rename to llama-cuda-win-x64.dll → upload to HF
-```

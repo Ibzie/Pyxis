@@ -1,22 +1,31 @@
-"""Text-to-speech backends and a sentence-grained playback queue.
+"""Text-to-speech backends and the render-then-play narration player (E9).
 
 Primary backend: Piper (neural, ~65 MB voice file, fully offline).
 Fallback: pyttsx3 (eSpeak, robotic but zero ML deps) — auto-detected at
-import time. The SpeechQueue runs on a QThread so the UI never blocks;
-it emits `chunk_started(str)` before speaking each sentence and
-`chunk_done()` after, so callers can highlight words or track progress.
+import time. Both engines *render* text to PCM (`render_pcm`) / WAV
+(`render_wav`); they never touch the audio device themselves.
 
-The queue supports sentence-level pause/resume: pausing cancels the
-currently-playing chunk and re-queues it; resuming replays that sentence
-from the top. Rate and volume are adjustable at runtime via `set_rate`
-and `set_volume`, which dispatch to the active engine.
+`NarrationPlayer` owns playback: the narrator renderer synthesizes each
+sentence chunk off-thread and appends it to the player's PCM timeline;
+the player thread walks that timeline and writes small blocks to the
+audio device. Pause/resume is a frame pointer — sample-accurate, and
+rendering keeps buffering ahead while paused so resume is instant. This
+replaces the old speak-queue design, where pause had to cancel in-flight
+synthesis and re-stash sentences (a nest of races: dropped cancels,
+double-replayed sentences, and R/C landing on a still-paused queue).
+
+Bookmarks are exact: each appended chunk records its (page, chunk) tag,
+and the timeline's frame offsets are prefix sums, so `position_changed`
+and cross-session resume map between audio frames and document positions
+without guessing.
 """
 
 import re
-import queue
-import threading
+import os
+import wave
+import time
 import logging
-from collections import deque
+import threading
 from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -29,22 +38,6 @@ VOICE_MODEL = "en_US-lessac-medium.onnx"
 VOICE_CONFIG = "en_US-lessac-medium.onnx.json"
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
-
-
-class _EndMarker:
-    """Silent sentinel queued after a narrated page's chunks. The SpeechQueue
-    never speaks it; when reached, it means every chunk queued before it has
-    finished playing, so the resume pointer may safely advance (A2)."""
-    __slots__ = ("page",)
-
-    def __init__(self, page):
-        self.page = page
-
-
-class _StopMarker:
-    """Sentinel that drains remaining text then stops the queue thread
-    (used to speak a farewell before teardown)."""
-    __slots__ = ()
 
 
 def split_sentences(text):
@@ -78,7 +71,8 @@ def split_sentences(text):
 
 
 # Piper's SynthesisConfig exposes length_scale (inverse of speed) and volume.
-# Guard the import so volume always works even on older piper builds.
+# Guard the import so older piper builds still work (volume then becomes a
+# manual int16 scale in render_wav).
 try:
     from piper import SynthesisConfig as _SynthesisConfig
     _HAS_SYNTH_CONFIG = True
@@ -87,15 +81,13 @@ except Exception:
 
 
 class PiperEngine:
-    """Piper neural TTS — primary backend."""
+    """Piper neural TTS — primary backend (synthesis only, no playback)."""
 
     def __init__(self, on_status=None):
         self._voice = None
         self._sample_rate = 22050
-        self._cancel = False
-        self._speaking = False
-        self._volume = 1.0          # 0.0–1.0
-        self._length_scale = 1.0   # >1 slows down; 1.0 = native speed
+        self._volume = 1.0          # 0.0–1.0 (applied in render_wav)
+        self._length_scale = 1.0    # >1 slows down; 1.0 = native speed
         self._load_voice(on_status)
 
     def _load_voice(self, on_status):
@@ -126,73 +118,47 @@ class PiperEngine:
     def set_volume(self, v):
         self._volume = max(0.0, min(v, 1.0))
 
-    def speak(self, text):
+    def _synthesize(self, text, volume):
+        if _HAS_SYNTH_CONFIG:
+            cfg = _SynthesisConfig(length_scale=self._length_scale, volume=volume)
+            return list(self._voice.synthesize(text, cfg))
+        return list(self._voice.synthesize(text))
+
+    def render_pcm(self, text):
+        """Synthesize `text` to mono int16 PCM: (ndarray, sample_rate), or
+        None for empty input. Volume is NOT baked in — the player applies it
+        live so the slider takes effect on the block currently playing."""
+        if not text.strip() or self._voice is None:
+            return None
         import numpy as np
-        import sounddevice as sd
-        if not text.strip():
-            return
-        self._cancel = False
-        self._speaking = True
-        try:
-            if _HAS_SYNTH_CONFIG:
-                cfg = _SynthesisConfig(length_scale=self._length_scale,
-                                       volume=self._volume)
-                chunks = list(self._voice.synthesize(text, cfg))
-            else:
-                chunks = list(self._voice.synthesize(text))
-            if not chunks or self._cancel:
-                return
-            audio = np.concatenate([
-                np.frombuffer(c.audio_int16_bytes, dtype=np.int16) for c in chunks
-            ])
-            if not _HAS_SYNTH_CONFIG and self._volume != 1.0:
-                audio = (audio.astype(np.float32) * self._volume)
-                audio = np.clip(audio, -32767, 32767).astype(np.int16)
-            if self._cancel or len(audio) == 0:
-                return
-            sd.play(audio, self._sample_rate)
-            sd.wait()
-        except Exception as e:
-            log.warning("speak failed: %s", e)
-        finally:
-            self._speaking = False
-
-    def cancel(self):
-        self._cancel = True
-        try:
-            import sounddevice as sd
-            sd.stop()
-        except Exception:
-            pass
-
-    def is_speaking(self):
-        return self._speaking
+        chunks = self._synthesize(text, 1.0)
+        if not chunks:
+            return None
+        audio = np.concatenate([
+            np.frombuffer(c.audio_int16_bytes, dtype=np.int16) for c in chunks
+        ])
+        if len(audio) == 0:
+            return None
+        return audio, self._sample_rate
 
     def render_wav(self, text, path):
-        """Synthesize `text` to a WAV file without playing it (A10). The
-        frames Piper already produces per sentence are written straight to a
-        wave file, so exports match exactly what live playback sounds like."""
+        """Synthesize `text` to a WAV file (A10). The frames Piper already
+        produces per sentence are written straight to a wave file, so exports
+        match exactly what live playback sounds like."""
         if not self._voice:
             raise RuntimeError("No TTS voice loaded")
-        import wave
         if not text.strip():
             raise RuntimeError("Nothing to render")
         with wave.open(str(path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(self._sample_rate)
-            if _HAS_SYNTH_CONFIG:
-                cfg = _SynthesisConfig(length_scale=self._length_scale,
-                                       volume=self._volume)
-                chunks = list(self._voice.synthesize(text, cfg))
-            else:
-                chunks = list(self._voice.synthesize(text))
+            chunks = self._synthesize(text, self._volume)
             for c in chunks:
                 wf.writeframes(c.audio_int16_bytes)
         return path
 
     def shutdown(self):
-        self.cancel()
         if self._voice is not None:
             try:
                 del self._voice
@@ -212,7 +178,6 @@ class Pyttsx3Engine:
         self._engine.setProperty("rate", 180)
         self._engine.setProperty("volume", 1.0)
         self._rate_mult = 1.0
-        self._speaking = False
 
     def set_rate(self, speed):
         speed = max(0.25, min(speed, 4.0))
@@ -222,30 +187,51 @@ class Pyttsx3Engine:
     def set_volume(self, v):
         self._engine.setProperty("volume", max(0.0, min(v, 1.0)))
 
-    def speak(self, text):
+    def render_pcm(self, text):
+        """Render offline via pyttsx3's save_to_file, then read the WAV back
+        as mono int16 PCM (E9 — playback lives in NarrationPlayer)."""
         if not text.strip():
-            return
-        self._speaking = True
+            return None
+        import tempfile
+        import numpy as np
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
         try:
-            self._engine.say(text)
+            self._engine.save_to_file(text, path)
             self._engine.runAndWait()
+            with wave.open(path, "rb") as wf:
+                sr = wf.getframerate()
+                chans = wf.getnchannels()
+                raw = wf.readframes(wf.getnframes())
+            data = np.frombuffer(raw, dtype=np.int16)
+            if chans == 2:
+                data = data[::2]
+            if len(data) == 0:
+                return None
+            return data, sr
         finally:
-            self._speaking = False
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
-    def cancel(self):
+    def render_wav(self, text, path):
+        rendered = self.render_pcm(text)
+        if rendered is None:
+            raise RuntimeError("Nothing to render")
+        data, sr = rendered
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(data.tobytes())
+        return path
+
+    def shutdown(self):
         try:
             self._engine.stop()
         except Exception:
             pass
-        self._speaking = False
-
-    def is_speaking(self):
-        # A3: was hardcoded `return False`, which made Escape's stop-narration
-        # unreachable on the pyttsx3 fallback engine.
-        return self._speaking
-
-    def shutdown(self):
-        self.cancel()
 
 
 def create_engine(on_status=None):
@@ -288,8 +274,9 @@ class VoiceLoadWorker(QThread):
 
 
 class WavExportWorker(QThread):
-    """Render text to a WAV file off the GUI thread (A10). Piper-only —
-    pyttsx3 has no offline render-to-file path."""
+    """Render text to a WAV file off the GUI thread (A10). Used when the
+    requested page hasn't been narrated yet; otherwise NarrationPlayer
+    exports its rendered buffer directly (captions included)."""
     done = pyqtSignal(str)
     failed = pyqtSignal(str)
 
@@ -302,164 +289,332 @@ class WavExportWorker(QThread):
     def run(self):
         try:
             if not hasattr(self.engine, "render_wav"):
-                raise RuntimeError(
-                    "WAV export needs the Piper voice (pyttsx3 cannot render files)")
+                raise RuntimeError("WAV export needs a TTS voice")
             self.engine.render_wav(self.text, self.path)
             self.done.emit(self.path)
         except Exception as e:
             log.error("wav export failed: %s", e)
             self.failed.emit(str(e))
 
+class NarrationPlayer(QThread):
+    """Render-then-play narration engine (E9).
 
-class SpeechQueue(QThread):
-    """Background thread that speaks enqueued text chunks sequentially.
+    The narrator renderer synthesizes sentence chunks to PCM off the GUI
+    thread and appends them here (`append_chunk`); this thread walks the
+    concatenated timeline, writing small blocks to the audio device.
 
-    Signals:
-        chunk_started(str)  — fired before each chunk is spoken
-        chunk_done()        — fired after each chunk finishes
-        queue_empty()        — fired when the queue drains completely
-        failed(str)         — fired on engine errors
-        position_started(int, int) — (page, chunk) meta tag of a chunk that
-                                     actually began playing (A2: persist only
-                                     what was really heard)
-        page_end(int)       — an _EndMarker was reached, so every chunk queued
-                              before it has finished playing
+    * Pause/resume is a frame pointer — sample-accurate; rendering keeps
+      buffering ahead while paused, so resume is instant.
+    * `begin(start_at=(page, chunk, frame))` starts a session optionally
+      jumping to a persisted resume position once that chunk is appended.
+    * Bookmarks are exact: every timeline entry carries its (page, chunk)
+      tag and the offsets are prefix sums, so `position_changed` reports
+      what the user has actually heard and `page_finished` fires only when
+      a page's audio truly ran out.
+    * Volume applies per block at write time — the slider is live.
+    * Speed is baked in at render time (applies to chunks not yet
+      synthesized, same as before).
 
-    Pause/resume is sentence-grained: pause() cancels the in-flight chunk
-    and stashes it; resume() re-queues it so the same sentence replays
-    from the top. set_rate()/set_volume() forward to the engine.
+    States (state_changed): rendering | playing | paused | underrun |
+    finished | stopped. `underrun` = playback caught up with the renderer
+    (e.g. a vision call is describing an image) and is waiting for more.
     """
 
-    chunk_started = pyqtSignal(str)
-    chunk_done = pyqtSignal()
-    queue_empty = pyqtSignal()
+    state_changed = pyqtSignal(str)
+    position_changed = pyqtSignal(int, int)   # (page, chunk) heard up to
+    page_finished = pyqtSignal(int)           # a page's audio played to the end
     failed = pyqtSignal(str)
-    position_started = pyqtSignal(int, int)
-    page_end = pyqtSignal(int)
+
+    _BLOCK = 4096   # frames per device write (~0.19 s at 22 kHz)
 
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self._engine = engine
-        self._queue = queue.Queue()
-        self._front = deque()             # re-queued chunks (resume priority)
-        self._running = True
-        self._paused = threading.Event()  # set => paused
         self._lock = threading.Lock()
-        self._current = None              # chunk currently being spoken
-        self._pending = None              # chunk captured by pause(), awaiting resume
+        self._timeline = []       # {samples, sr, page, chunk}
+        self._offsets = []        # cumulative frame offset at each entry start
+        self._total = 0           # frames appended so far
+        self._render_done = True
+        self._frame_pos = 0
+        self._playing = False
+        self._paused = False
+        self._stop_flag = True
+        self._volume = 1.0
+        self._start_at = None     # (page, chunk, frame) resume target
+        self._state = "stopped"
+        self._last_pos_key = None
+        self._stream = None
+        self._stream_sr = 0
 
-    def enqueue(self, text, meta=None):
-        """Add text to the speak queue. Splits into sentence-grained chunks.
-        `meta` is an optional (page, chunk) tag emitted via position_started
-        once the chunk actually starts playing."""
-        for chunk in split_sentences(text):
-            self._queue.put((chunk, meta))
+    # ── main-thread API ────────────────────────────────────────────────────
+    def begin(self, start_at=None):
+        """Start a new narration session: reset the timeline; playback will
+        start as soon as the renderer appends the first chunk."""
+        with self._lock:
+            self._timeline = []
+            self._offsets = []
+            self._total = 0
+            self._frame_pos = 0
+            self._render_done = False
+            self._playing = True
+            self._paused = False
+            self._stop_flag = False
+            self._start_at = start_at
+            self._last_pos_key = None
+            self._close_stream_locked()
+        self._set_state("rendering")
+        if not self.isRunning():
+            self.start()
 
-    def enqueue_end(self, page):
-        """Queue a silent page-end marker after the current text (A2)."""
-        self._queue.put(_EndMarker(page))
+    def append_chunk(self, samples, page, chunk, sr):
+        if samples is None or len(samples) == 0:
+            return
+        with self._lock:
+            if self._start_at is not None:
+                tgt = self._start_at
+                if (page, chunk) == tgt[:2]:
+                    # Jump to the persisted position — may point into later
+                    # sentences of the same chunk; playback simply waits for
+                    # those frames to exist.
+                    self._frame_pos = self._total + tgt[2]
+                    self._start_at = None
+                elif page is not None and (page, chunk) > tgt[:2]:
+                    # Chunks arrive in order — we're past the target without
+                    # matching it (index drift between sessions): drop it.
+                    self._start_at = None
+            self._timeline.append({"samples": samples, "sr": sr,
+                                   "page": page, "chunk": chunk})
+            self._offsets.append(self._total)
+            self._total += len(samples)
+        if not self.isRunning():
+            self.start()
 
-    def flush_and_stop(self):
-        """Speak everything already queued, then exit the thread. Used to
-        announce "Accessibility mode off" before the engine is torn down."""
-        self._queue.put(_StopMarker())
+    def render_finished(self):
+        with self._lock:
+            self._render_done = True
 
     def pause(self):
-        """Pause playback. Cancels the in-flight sentence and stashes it so
-        resume() replays it from the top."""
         with self._lock:
-            if self._current is not None:
-                self._pending = self._current
-                self._current = None
-        self._paused.set()
-        self._engine.cancel()
+            if self._playing:
+                self._paused = True
+                self._pause_stream_locked()
+        self._set_state("paused")
 
     def resume(self):
-        """Resume playback. Re-queues the stashed sentence at the front."""
         with self._lock:
-            if self._pending is not None:
-                self._front.appendleft(self._pending)
-                self._pending = None
-        self._paused.clear()
-
-    def is_paused(self):
-        return self._paused.is_set()
-
-    def set_rate(self, speed):
-        if hasattr(self._engine, "set_rate"):
-            self._engine.set_rate(speed)
-
-    def set_volume(self, v):
-        if hasattr(self._engine, "set_volume"):
-            self._engine.set_volume(v)
-
-    def cancel(self):
-        """Clear the queue and stop current playback immediately."""
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
-        with self._lock:
-            self._front.clear()
-            self._current = None
-            self._pending = None
-        self._paused.clear()
-        self._engine.cancel()
-
-    def run(self):
-        while self._running:
-            # Block while paused (spinning slowly so stop() still works).
-            while self._running and self._paused.is_set():
-                # Drain any chunks that arrive while paused into the queue
-                # so they play in order on resume (after the pending chunk).
-                try:
-                    extra = self._queue.get(timeout=0.05)
-                    self._front.append(extra)
-                except queue.Empty:
-                    pass
-            if not self._running:
-                break
-            # Resume-priority chunk first, then the main queue.
-            item = None
-            with self._lock:
-                if self._front:
-                    item = self._front.popleft()
-            if item is None:
-                try:
-                    item = self._queue.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-            if item is None:
-                break  # stop() sentinel
-            if isinstance(item, _EndMarker):
-                self.page_end.emit(item.page)
-                continue
-            if isinstance(item, _StopMarker):
-                self._running = False
-                break
-            text, meta = item
-            with self._lock:
-                self._current = item
-            self.chunk_started.emit(text)
-            if meta is not None:
-                self.position_started.emit(*meta)
-            self._engine.speak(text)
-            with self._lock:
-                # If pause() captured it, _current is already None — leave it.
-                if self._current is item:
-                    self._current = None
-            self.chunk_done.emit()
-        self.queue_empty.emit()
+            self._paused = False
+            self._resume_stream_locked()
+        self._set_state("playing")
 
     def stop(self):
-        """Stop the thread, cancel playback, and wait for exit."""
-        self._running = False
-        self._paused.clear()
-        self._queue.put(None)
-        self._engine.cancel()
+        """Stop playback, clear the timeline, and exit the thread."""
+        with self._lock:
+            self._stop_flag = True
+            self._playing = False
+            self._paused = False
+            self._timeline = []
+            self._offsets = []
+            self._total = 0
+            self._frame_pos = 0
+            self._render_done = True
+            self._close_stream_locked()
+        self._set_state("stopped")
         self.wait(3000)
 
-    @property
-    def pending(self):
-        return self._queue.qsize() + len(self._front)
+    def set_volume(self, v):
+        self._volume = max(0.0, min(v, 1.0))
+
+    def state(self):
+        return self._state
+
+    def is_active(self):
+        return self._state in ("rendering", "playing", "paused", "underrun")
+
+    def is_paused(self):
+        return self._paused and self._playing
+
+    def current_position(self):
+        """(page, chunk, frame_within_chunk) the user has heard up to —
+        the point that should be persisted for cross-session resume."""
+        with self._lock:
+            return self._position_locked(self._frame_pos)
+
+    def active_page(self):
+        with self._lock:
+            for e in reversed(self._timeline):
+                if e["page"] is not None:
+                    return e["page"]
+        return None
+
+    def save_wav(self, path):
+        """Write the rendered timeline (captions included) to a WAV file.
+        Returns True if there was audio to save."""
+        with self._lock:
+            if not self._timeline:
+                return False
+            sr = self._timeline[0]["sr"]
+            import numpy as np
+            data = np.concatenate([e["samples"] for e in self._timeline])
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(data.tobytes())
+        return True
+
+    # ── internals ──────────────────────────────────────────────────────────
+    def _set_state(self, state):
+        if state != self._state:
+            self._state = state
+            self.state_changed.emit(state)
+
+    def _entry_at_locked(self, frame):
+        """Timeline index containing playback frame `frame`."""
+        lo, hi, idx = 0, len(self._offsets) - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._offsets[mid] <= frame:
+                idx = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return idx
+
+    def _slice_locked(self, pos, count):
+        import numpy as np
+        parts, remaining = [], count
+        i = self._entry_at_locked(pos)
+        off = pos - self._offsets[i]
+        while remaining > 0 and i < len(self._timeline):
+            s = self._timeline[i]["samples"][off:off + remaining]
+            parts.append(s)
+            remaining -= len(s)
+            i += 1
+            off = 0
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+    def _position_locked(self, frame_pos):
+        """Map a frame position to (page, chunk, frame-within-chunk)."""
+        if not self._timeline or frame_pos <= 0:
+            return None, -1, 0
+        i = self._entry_at_locked(min(frame_pos, self._total) - 1)
+        e = self._timeline[i]
+        if e["page"] is None:
+            return None, -1, 0
+        # Frame offset relative to the chunk's FIRST sentence, so a saved
+        # position maps exactly onto the re-rendered chunk on resume.
+        chunk_start = self._offsets[i]
+        j = i
+        while j > 0 and self._same_chunk(self._timeline[j - 1], e):
+            j -= 1
+            chunk_start = self._offsets[j]
+        return e["page"], e["chunk"], frame_pos - chunk_start
+
+    @staticmethod
+    def _same_chunk(a, b):
+        return a["page"] is not None and a["page"] == b["page"] and a["chunk"] == b["chunk"]
+
+    def _last_page_locked(self):
+        for e in reversed(self._timeline):
+            if e["page"] is not None:
+                return e["page"]
+        return None
+
+    def _close_stream_locked(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+            self._stream_sr = 0
+
+    def _pause_stream_locked(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+
+    def _resume_stream_locked(self):
+        if self._stream is not None:
+            try:
+                self._stream.start()
+            except Exception:
+                self._stream = None
+                self._stream_sr = 0
+
+    def _ensure_stream(self, sd, sr):
+        if self._stream is not None and self._stream_sr == sr:
+            return
+        self._close_stream_locked()
+        self._stream = sd.OutputStream(
+            samplerate=sr, channels=1, dtype="int16")
+        self._stream.start()
+        self._stream_sr = sr
+
+    # ── playback thread ────────────────────────────────────────────────────
+    def run(self):
+        try:
+            import numpy as np
+            import sounddevice as sd
+            while True:
+                with self._lock:
+                    if self._stop_flag:
+                        break
+                    playing = self._playing
+                    paused = self._paused
+                if not playing:
+                    time.sleep(0.05)
+                    continue
+                if paused:
+                    time.sleep(0.05)
+                    continue
+                with self._lock:
+                    avail = self._total - self._frame_pos
+                    data = None
+                    entry = None
+                    done_now = False
+                    last_page = None
+                    if avail <= 0:
+                        if self._render_done:
+                            self._playing = False
+                            done_now = True
+                            last_page = self._last_page_locked()
+                            self._close_stream_locked()
+                    else:
+                        count = min(avail, self._BLOCK)
+                        data = self._slice_locked(self._frame_pos, count)
+                        entry = self._timeline[self._entry_at_locked(
+                            self._frame_pos + count - 1)]
+                        self._frame_pos += count
+                if data is None:
+                    if done_now:
+                        if last_page is not None:
+                            self.page_finished.emit(last_page)
+                        self._set_state("finished")
+                        break
+                    # Playback caught up with the renderer (vision call…)
+                    self._set_state("underrun")
+                    time.sleep(0.1)
+                    continue
+                if self._volume != 1.0:
+                    scaled = data.astype(np.float32) * self._volume
+                    data = np.clip(scaled, -32767, 32767).astype(np.int16)
+                self._ensure_stream(sd, entry["sr"])
+                self._set_state("playing")
+                self._stream.write(data)
+                with self._lock:
+                    page, chunk, _ = self._position_locked(self._frame_pos)
+                if page is not None and (page, chunk) != self._last_pos_key:
+                    self._last_pos_key = (page, chunk)
+                    self.position_changed.emit(page, chunk)
+        except Exception as e:
+            log.exception("narration player failed")
+            self.failed.emit(str(e))
+        finally:
+            with self._lock:
+                self._close_stream_locked()
+                self._stop_flag = True
+                self._playing = False

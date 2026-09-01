@@ -40,19 +40,30 @@ class IndexWorker(QThread):
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        # L4: capture the path now — a PDF switch while this worker runs must
+        # not silently re-index the newly opened file.
+        self.path = engine.path
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
 
     def run(self):
         try:
             import fitz
             from .rag import RagIndex
-            doc = fitz.open(self.engine.path)
-            rag = RagIndex()
-            total = doc.page_count
-            for i in range(total):
-                self.progress.emit(i, total, f"Indexing page {i+1}/{total}…")
-                rag.index_page(doc.load_page(i), i)
-            rag.finalize()
-            doc.close()
+            doc = fitz.open(self.path)
+            try:
+                rag = RagIndex()
+                total = doc.page_count
+                for i in range(total):
+                    if self._cancel:
+                        return
+                    self.progress.emit(i, total, f"Indexing page {i+1}/{total}…")
+                    rag.index_page(doc.load_page(i), i)
+                rag.finalize()
+            finally:
+                doc.close()
             self.done.emit(rag)
         except Exception as e:
             self.failed.emit(str(e))

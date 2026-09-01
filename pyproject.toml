@@ -28,6 +28,7 @@ dependencies = [
     "llama-cpp-python>=0.3",
     "huggingface_hub>=0.20",
     "psutil>=5.9",
+    "nvidia-ml-py>=11.5",
     "markdown-it-py>=3.0",
     "mdit-py-plugins>=0.4",
     "linkify-it-py>=2.0",

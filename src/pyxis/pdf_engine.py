@@ -23,7 +23,9 @@ class PdfEngine:
         self.page_sizes = []
 
     def open(self, path, password=None):
-        self.close()
+        # L1: validate the new document fully BEFORE swapping state — a
+        # failed open leaves the previous document intact instead of an
+        # empty engine behind stale page widgets.
         doc = fitz.open(path)
         if doc.needs_pass:
             if password and doc.authenticate(password):
@@ -31,23 +33,28 @@ class PdfEngine:
             else:
                 doc.close()
                 raise PasswordRequired(path)
+        page_sizes = []
+        count = len(doc)
+        for i in range(count):
+            rect = doc.load_page(i).rect
+            page_sizes.append((rect.width, rect.height))
+        bookmarks = []
+        try:
+            if doc.outline:
+                self._read_bookmarks(doc.outline, 0, bookmarks)
+        except Exception:
+            bookmarks = []
+        old = self.doc
         self.doc = doc
         self.path = path
-        self.page_count = len(self.doc)
-        self.metadata = self.doc.metadata or {}
+        self.page_count = count
+        self.metadata = doc.metadata or {}
         self.version = self.metadata.get("format", "PDF")
-        self.bookmarks = []
+        self.bookmarks = bookmarks
         self.cache.clear()
-        self.page_sizes = []
-        for i in range(self.page_count):
-            page = self.doc.load_page(i)
-            rect = page.rect
-            self.page_sizes.append((rect.width, rect.height))
-        try:
-            if self.doc.outline:
-                self._read_bookmarks(self.doc.outline, 0)
-        except Exception:
-            self.bookmarks = []
+        self.page_sizes = page_sizes
+        if old is not None:
+            old.close()
 
     def close(self):
         if self.doc:
@@ -61,15 +68,15 @@ class PdfEngine:
         self.cache.clear()
         self.page_sizes = []
 
-    def _read_bookmarks(self, item, level):
+    def _read_bookmarks(self, item, level, out):
         while item:
             try:
                 title = item.title
             except Exception:
                 title = ""
-            self.bookmarks.append({"title": title, "page": item.page, "level": level})
+            out.append({"title": title, "page": item.page, "level": level})
             if item.down:
-                self._read_bookmarks(item.down, level + 1)
+                self._read_bookmarks(item.down, level + 1, out)
             item = item.next
 
     def page_size(self, idx, zoom=1.0):

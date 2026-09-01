@@ -98,75 +98,38 @@ def detect_capacity():
 
 
 def ensure_gpu_native(on_status=None):
-    """If the bundled llama-cpp-python is CPU-only but a CUDA GPU is detected,
-    download a CUDA-built ``libllama`` shared library into the app's data
-    directory and prepend that directory to ``LD_LIBRARY_PATH`` / ``PATH``.
-
-    Returns True if the app should restart to pick up the new library.
-    The caller (``main.py``) is responsible for actually restarting."""
+    """No-op (M3). The previous implementation tried to swap a CUDA-built
+    libllama in via PATH/LD_LIBRARY_PATH, but llama-cpp-python loads its
+    shared library by absolute path from llama_cpp/lib, so the injection
+    could never take effect — it just downloaded ~15 MB, restarted the app,
+    and still ran CPU-only. GPU users should install the CUDA build
+    directly (CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python);
+    we only log a hint when we see an NVIDIA GPU with a CPU-only wheel.
+    Always returns False (never restart)."""
     if sys.platform == "darwin":
-        return False   # Metal is built into the default wheel; no swap needed
+        return False   # Metal is built into the default wheel
     try:
         import pynvml
         pynvml.nvmlInit()
         pynvml.nvmlShutdown()
     except Exception:
         return False   # no NVIDIA GPU → nothing to do
-    # Check if the bundled llama already supports CUDA.
     try:
-        from llama_cpp import Llama
-        # Heuristic: if llama.cpp was built with CUDA, the ggml-cuda lib is
-        # loaded at import time. We can check by looking at loaded shared libs.
         import llama_cpp
         lib_dir = Path(llama_cpp.__file__).parent
         has_cuda = any(
             ("cuda" in f.name.lower() or "cublas" in f.name.lower())
             for f in lib_dir.rglob("*")
         )
-        if has_cuda:
-            return False   # already GPU-enabled
+        if not has_cuda:
+            log.info(
+                "NVIDIA GPU detected but llama-cpp-python is CPU-only. "
+                "For GPU inference, reinstall with "
+                "CMAKE_ARGS=\"-DGGML_CUDA=on\" pip install --force-reinstall "
+                "llama-cpp-python")
     except Exception:
         pass
-    # Download the CUDA-built libllama for this platform.
-    from .storage import app_data_dir
-    native_dir = app_data_dir() / "native"
-    native_dir.mkdir(parents=True, exist_ok=True)
-    if sys.platform == "win32":
-        lib_name = "llama.dll"
-        asset_name = "llama-cuda-win-x64.dll"
-    else:
-        lib_name = "libllama.so"
-        asset_name = "libllama-cuda12-linux-x64.so"
-    lib_path = native_dir / lib_name
-    if lib_path.exists():
-        _inject_native_dir(native_dir)
-        return False   # already downloaded — just inject and continue
-    if on_status:
-        on_status("Downloading CUDA build for faster AI (~15 MB)…")
-    try:
-        from huggingface_hub import hf_hub_download
-        # Host the CUDA libs in a dedicated HF repo (or GitHub releases).
-        # Using HF keeps the download path consistent with model downloads.
-        downloaded = hf_hub_download(
-            repo_id="pyxis/native-libs",
-            filename=asset_name,
-            cache_dir=str(native_dir.parent / "native-cache"),
-        )
-        import shutil
-        shutil.copy2(downloaded, lib_path)
-    except Exception as e:
-        log.warning("CUDA lib download failed: %s", e)
-        return False
-    _inject_native_dir(native_dir)
-    return True   # restart recommended — native lib loads at import time
-
-
-def _inject_native_dir(native_dir):
-    """Prepend the native-lib dir to the library search path."""
-    import os
-    path_var = "PATH" if sys.platform == "win32" else "LD_LIBRARY_PATH"
-    current = os.environ.get(path_var, "")
-    os.environ[path_var] = str(native_dir) + (os.pathsep + current if current else "")
+    return False
 
 
 def pick_model(ram_gb):
@@ -331,9 +294,14 @@ class AILayer:
                 on_status("Preparing vision projector…")
             try:
                 from llama_cpp.llama_chat_format import Gemma4ChatHandler
+                # cache_dir points at the same HF cache the manual download
+                # above used, so from_pretrained finds the file already
+                # present instead of silently re-downloading it into the
+                # default ~/.cache/huggingface (H2).
                 handler = Gemma4ChatHandler.from_pretrained(
                     repo_id=self.repo_id, filename=MMPROJ_FILENAME,
                     use_gpu=self.accel != "cpu", verbose=False,
+                    cache_dir=str(self._models_cache_dir()),
                 )
                 log.info("vision handler ready: %s", MMPROJ_FILENAME)
             except Exception as e:
@@ -361,6 +329,9 @@ class AILayer:
             kwargs = dict(
                 repo_id=self.repo_id, filename=self.filename,
                 n_ctx=n_ctx, n_gpu_layers=n_gpu, type_k=_kvk, verbose=False,
+                # H2: same cache the manual download used — no second,
+                # invisible multi-GB download into ~/.cache/huggingface.
+                cache_dir=str(self._models_cache_dir()),
             )
             if len(files) > 1:
                 kwargs["additional_files"] = files[1:]
@@ -376,31 +347,55 @@ class AILayer:
                 self.unload()
         if self.llm is None:
             raise RuntimeError("Could not allocate llama context — see ai_layer log")
+        if handler is not None:
+            # H3: failed attempts call unload() above, which clears
+            # _handler — restore it once an attempt succeeds, or vision
+            # stays dead forever after any load fallback (with a very
+            # misleading "model is text-only" error).
+            self._handler = handler
         if on_status:
             on_status(f"Loaded {self.tier['name']} ({self.quant_label()})")
         log.info("loaded: %s, n_ctx=%d", self.tier['name'], self._loaded_n_ctx)
 
     def unload(self):
-        """Release the loaded model and vision handler, reclaim resident RAM."""
-        if self.llm is not None:
-            try:
-                del self.llm
-            except Exception:
-                pass
-        self.llm = None
-        if self._handler is not None:
-            try:
-                del self._handler
-            except Exception:
-                pass
-        self._handler = None
-        gc.collect()
+        """Release the loaded model and vision handler, reclaim resident RAM.
 
-    def _download(self, files, on_status=None, on_progress=None):
-        from huggingface_hub import hf_hub_download
+        Takes the inference lock (H1): freeing the native context while a
+        narration/vision call is mid-inference is a use-after-free that
+        segfaults the whole app. If the lock can't be acquired within 10 s
+        (a hung call), the model is left loaded — safe, just not reclaimed.
+        Callers that can't afford the wait refuse first (see the
+        NarratorWorker.is_describing guards in main.py)."""
+        acquired = self._infer_lock.acquire(timeout=10)
+        if not acquired:
+            log.warning("unload skipped: inference still running after 10 s")
+            return
+        try:
+            if self.llm is not None:
+                try:
+                    del self.llm
+                except Exception:
+                    pass
+            self.llm = None
+            if self._handler is not None:
+                try:
+                    del self._handler
+                except Exception:
+                    pass
+            self._handler = None
+            gc.collect()
+        finally:
+            self._infer_lock.release()
+
+    def _models_cache_dir(self):
         from .storage import app_data_dir
         cache_dir = app_data_dir() / "models"
         cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _download(self, files, on_status=None, on_progress=None):
+        from huggingface_hub import hf_hub_download
+        cache_dir = self._models_cache_dir()
         _SignalTqdm._callback = on_progress
         try:
             for i, fn in enumerate(files, 1):
@@ -520,7 +515,6 @@ class AILayer:
     def generate(self, messages, on_token=None, enable_thinking=False):
         if not self.llm:
             raise RuntimeError("AI model not loaded")
-        self.reset_cancel()
         # Gemma 4 thinking is toggled by a `<|think|>` token at the start of
         # the system prompt (per the model card). We inject it when the caller
         # asks for thinking, omit it otherwise. Non-Gemma models ignore the
@@ -528,7 +522,11 @@ class AILayer:
         msgs = self._with_thinking(messages, enable_thinking)
         # Hold the inference lock for the whole stream (E2) so narration's
         # describe_image and any other inference never hit llama concurrently.
+        # reset_cancel happens INSIDE the lock (M1): a cancel requested while
+        # this call was queued behind another inference is honored instead of
+        # being silently wiped on entry.
         with self._infer_lock:
+            self.reset_cancel()
             stream = self.llm.create_chat_completion(
                 messages=msgs, stream=True, max_tokens=MAX_TOKENS
             )

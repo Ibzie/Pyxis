@@ -1,7 +1,7 @@
 import sys, json, os, logging, logging.handlers, threading
 from datetime import datetime
 from pathlib import Path
-from PyQt6.QtCore import Qt, QPoint, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QPoint, QThread, QTimer, QEventLoop, pyqtSignal
 from PyQt6.QtGui import QColor, QKeyEvent, QCursor, QAction, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -19,7 +19,7 @@ from .storage import (
 )
 from .ai_layer import AILayer, TIERS, detect_capacity, fit_level
 from .ai_workers import LoadWorker, InferWorker, IndexWorker
-from .speech import SpeechQueue, VoiceLoadWorker, WavExportWorker
+from .speech import NarrationPlayer, VoiceLoadWorker, WavExportWorker
 from .narrator import NarratorWorker
 from .whiteboard import WhiteboardWidget
 
@@ -71,9 +71,10 @@ class MainWindow(QMainWindow):
         # Accessibility (TTS + narrator)
         self._a11y_mode = False
         self._speech_engine = None
-        self._speech_queue = None
+        self._player = None            # NarrationPlayer (render-then-play, E9)
+        self._renderer = None          # NarratorWorker (PCM renderer)
         self._voice_loader = None      # A9: background Piper voice download
-        self._narrator_worker = None
+        self._img_worker = None        # ad-hoc image-description worker
         self._a11y_speed = 1.0   # multiplier
         self._a11y_volume = 1.0  # 0.0–1.0
         self._resume_pos = None     # last persisted (page, chunk)
@@ -187,11 +188,14 @@ class MainWindow(QMainWindow):
 
         def _btn(text, tip, fn, checkable=False):
             """Toolbar button with a real name for OS screen readers (A6) —
-            icon-only glyphs otherwise announce as '◀'/'🎧' etc."""
+            icon-only glyphs otherwise announce as '◀'/'🎧' etc. Buttons take
+            no focus so a blind user's Space (pause narration) is never
+            hijacked into clicking whichever button was last used."""
             b = QPushButton(text)
             b.setToolTip(tip)
             b.setAccessibleName(tip)
             b.setCheckable(checkable)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.clicked.connect(fn)
             return b
 
@@ -243,6 +247,7 @@ class MainWindow(QMainWindow):
         self.toolbar.addWidget(self.btn_ui_settings)
         self.toolbar.addSeparator()
         self.model_label = QPushButton("AI: idle")
+        self.model_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.model_label.setStyleSheet(
             "QPushButton { background: #2a2a2a; color: #aaa; border: 1px solid #444; "
             "padding: 4px 10px; text-align: left; } QPushButton:hover { background: #333; }"
@@ -299,25 +304,30 @@ class MainWindow(QMainWindow):
         self.a11y_volume.setToolTip("Narration volume (0–100%)")
         self.a11y_volume.setAccessibleName("Narration volume")
         self.a11y_volume.valueChanged.connect(self._on_a11y_volume)
-        self.a11y_play_btn = QPushButton("⏸ Pause", checkable=True)
+        self.a11y_play_btn = QPushButton("⏸ Pause")
         self.a11y_play_btn.setToolTip("Pause or resume narration")
         self.a11y_play_btn.setAccessibleName("Pause or resume narration")
-        self.a11y_play_btn.clicked.connect(self._on_a11y_play_toggled)
+        self.a11y_play_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.a11y_play_btn.clicked.connect(self._toggle_pause)
         self.a11y_stop_btn = QPushButton("⏹ Stop")
         self.a11y_stop_btn.setToolTip("Stop narration and clear the queue")
         self.a11y_stop_btn.setAccessibleName("Stop narration and clear the queue")
+        self.a11y_stop_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.a11y_stop_btn.clicked.connect(self._stop_narration)
         self.a11y_continue_btn = QPushButton("⏭ Continue")
         self.a11y_continue_btn.setToolTip("Continue reading from saved position")
         self.a11y_continue_btn.setAccessibleName("Continue reading from saved position")
+        self.a11y_continue_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.a11y_continue_btn.clicked.connect(self._continue_reading)
         self.a11y_help_btn = QPushButton("? Help")
         self.a11y_help_btn.setToolTip("Accessibility help (keyboard shortcuts)")
         self.a11y_help_btn.setAccessibleName("Accessibility help (keyboard shortcuts)")
+        self.a11y_help_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.a11y_help_btn.clicked.connect(self._show_a11y_help)
         self.a11y_wav_btn = QPushButton("⏺ Save Audio")
         self.a11y_wav_btn.setToolTip("Export the current page's narration as a WAV file")
         self.a11y_wav_btn.setAccessibleName("Export the current page narration as WAV")
+        self.a11y_wav_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.a11y_wav_btn.clicked.connect(self._export_page_wav)
         self.a11y_bar.addWidget(QLabel("🎧"))
         self.a11y_bar.addWidget(QLabel("Speed:"))
@@ -336,6 +346,7 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak()  # second toolbar row below the main one
         self.addToolBar(self.a11y_bar)
         self.a11y_bar.setVisible(False)
+        self._update_a11y_buttons()
 
     def _build_sidebar(self):
         self.sidebar = QFrame()
@@ -378,8 +389,15 @@ class MainWindow(QMainWindow):
             self._whiteboard_timer.start()
 
     def _save_whiteboard_now(self):
-        if self.storage and self.whiteboard.has_content():
+        # Save whenever the whiteboard reports a change — including Clear,
+        # which must delete the stale PNG or the erased drawing resurrects
+        # on reopen (M5).
+        if not self.storage:
+            return
+        if self.whiteboard.has_content():
             self.storage.save_whiteboard(self.whiteboard.get_pixmap())
+        else:
+            self.storage.delete_whiteboard()
 
     def _whiteboard_export_md(self):
         """Extra markdown for notes-PDF export: the whiteboard image (D1)."""
@@ -422,6 +440,11 @@ class MainWindow(QMainWindow):
 
     def _start_indexing(self):
         self.rag_index = None
+        if self.index_worker is not None and self.index_worker.isRunning():
+            # L4: reassigning a running worker drops the last reference to a
+            # live QThread (hard abort on exit) — cancel it and let it finish.
+            self.index_worker.cancel()
+            self.index_worker.wait(2000)
         self.index_worker = IndexWorker(self.engine)
         self.index_worker.progress.connect(self._on_index_progress)
         self.index_worker.done.connect(self._on_index_done)
@@ -434,6 +457,10 @@ class MainWindow(QMainWindow):
 
     def _on_index_done(self, rag):
         self.rag_index = rag
+        # The persistent narration renderer may predate the index — point it
+        # at the fresh one so R/C use chunked narration, not the raw fallback.
+        if self._renderer is not None:
+            self._renderer.set_rag(rag)
         # Populate image-block bboxes on each PageView for hit-testing + focus.
         for page in self.pages:
             blocks = [c["image_rect"] for c in rag.chunks
@@ -481,6 +508,8 @@ class MainWindow(QMainWindow):
             self.notes_panel.set_text(self.storage.load_notes())
             self.notes_panel.set_base_dir(self.storage.folder)
             self.whiteboard.load_from_path(self.storage.whiteboard_file)
+            if self._renderer is not None:
+                self._renderer.set_storage(self.storage)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{e}")
             return
@@ -858,6 +887,14 @@ class MainWindow(QMainWindow):
             self.status.showMessage("AI busy — wait for it to finish (Esc to cancel)")
             self._speak("The AI is busy. Wait for it to finish, or press Escape to cancel.")
             return
+        if self._renderer is not None and self._renderer.is_describing():
+            # H1: freeing the model under a live vision call is a
+            # use-after-free; the renderer can't abort mid-call either.
+            self.status.showMessage(
+                "AI busy describing an image — press Esc to stop narration first")
+            self._speak("The AI is busy describing an image. "
+                        "Press Escape to stop narration first.")
+            return
         if self.ai.is_loaded():
             self.ai.unload()
         self.model_label.setText("AI: loading…")
@@ -878,6 +915,10 @@ class MainWindow(QMainWindow):
         if self.ai_infer and self.ai_infer.isRunning():
             # E1: freeing the model under an active generator would crash it.
             self.status.showMessage("AI busy — wait for it to finish (Esc to cancel)")
+            return
+        if self._renderer is not None and self._renderer.is_describing():
+            self.status.showMessage(
+                "AI busy describing an image — press Esc to stop narration first")
             return
         self.ai.unload()
         self.model_label.setText("AI: idle")
@@ -1058,11 +1099,39 @@ class MainWindow(QMainWindow):
         """Speak a status/confirmation message when accessibility is active
         (A4) — blind users get no visual status bar, so gated errors and
         mode changes must be audible."""
-        if self._a11y_mode and self._speech_queue:
-            self._speech_queue.enqueue(text)
+        if self._a11y_mode and self._renderer is not None and text.strip():
+            self._renderer.read_text(text)
 
     def _on_voice_status(self, msg):
         self.status.showMessage(f"TTS: {msg}")
+
+    def _renderer_worker(self):
+        """The persistent narration renderer, created once the TTS voice is
+        ready and reused for the app's lifetime (E9): R/C/N and status speech
+        all render to PCM here; the NarrationPlayer owns playback."""
+        if self._renderer is None:
+            self._renderer = NarratorWorker(
+                self.engine, self.rag_index, self.ai, self.storage,
+                self._speech_engine, self)
+            self._renderer.chunk_ready.connect(self._on_chunk_ready)
+            self._renderer.caption_ready.connect(self._on_caption_ready)
+            self._renderer.render_status.connect(self.status.showMessage)
+            self._renderer.render_done.connect(self._on_render_done)
+            self._renderer.failed.connect(
+                lambda m: self.status.showMessage(f"Narrator: {m}"))
+            self._renderer.start()
+        return self._renderer
+
+    def _on_chunk_ready(self, samples, page, chunk, sr):
+        """Renderer produced a sentence of PCM — hand it to the player (runs
+        on the GUI thread; the player's timeline is lock-protected)."""
+        if self._player is not None:
+            self._player.append_chunk(samples, page, chunk, sr)
+
+    def _on_render_done(self):
+        """The renderer drained its job queue — playback may now run out."""
+        if self._player is not None:
+            self._player.render_finished()
 
     def _on_voice_ready(self, engine):
         # User may have toggled a11y off (or quit) while we were loading —
@@ -1078,24 +1147,27 @@ class MainWindow(QMainWindow):
         self._speech_engine.set_rate(self._a11y_speed)
         if hasattr(self._speech_engine, "set_volume"):
             self._speech_engine.set_volume(self._a11y_volume)
-        self._speech_queue = SpeechQueue(self._speech_engine, self)
-        self._speech_queue.chunk_started.connect(
-            lambda t: self.status.showMessage(f"🔊 {t[:60]}"))
-        self._speech_queue.position_started.connect(self._on_position_played)
-        self._speech_queue.page_end.connect(self._on_page_played_to_end)
-        self._speech_queue.start()
+        # E9: the player owns playback; the renderer synthesizes PCM chunks.
+        self._player = NarrationPlayer(engine, self)
+        self._player.state_changed.connect(self._on_player_state)
+        self._player.position_changed.connect(self._on_position_played)
+        self._player.page_finished.connect(self._on_page_played_to_end)
+        self._player.failed.connect(lambda m: self.status.showMessage(f"TTS: {m}"))
         self._voice_loader = None
         self._voice_progress.setVisible(False)   # H2
-        self._speech_queue.enqueue(
+        renderer = self._renderer_worker()
+        self._player.begin()
+        renderer.read_text(
             "Accessibility mode on. Press R to read the current page, "
             "C to continue, question mark for help.")
         # A7: first time accessibility is ever enabled, read the full shortcut
         # list aloud so the feature is discoverable without a screen reader.
         if not a11y_onboarded():
             mark_a11y_onboarded()
-            self._speech_queue.enqueue(_keybinds_text())
+            renderer.read_text(_keybinds_text())
         self.status.showMessage(
             "Accessibility mode on — press R to read, C to continue, ? for help")
+        self._update_a11y_buttons()
 
     def _on_voice_failed(self, msg):
         self._voice_loader = None
@@ -1108,161 +1180,188 @@ class MainWindow(QMainWindow):
     def _a11y_off(self):
         self._a11y_mode = False
         self.a11y_bar.setVisible(False)
-        if self._narrator_worker:
-            self._narrator_worker.cancel()
-            self._narrator_worker = None
-        if self._speech_queue:
-            # Speak the "off" confirmation on the way out, then drain & stop.
-            # wait() blocks the main thread for the ~2s farewell so the engine
-            # isn't torn down mid-sentence.
-            self._speech_queue.cancel()
-            self._speech_queue.enqueue("Accessibility mode off")
-            self._speech_queue.flush_and_stop()
-            self._speech_queue.wait(8000)
-            self._speech_queue = None
+        if self._renderer is not None:
+            self._renderer.flush_jobs()
+        if self._player is not None:
+            # Speak the "off" confirmation on the way out, then drain & stop
+            # (bounded wait so the engine isn't torn down mid-sentence, and
+            # the GUI stays alive while it plays).
+            self._player.begin()
+            if self._renderer is not None:
+                self._renderer.read_text("Accessibility mode off")
+            loop = QEventLoop()
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+
+            def _done():
+                timer.stop()
+                loop.quit()
+
+            timer.timeout.connect(loop.quit)
+            self._player.state_changed.connect(
+                lambda s: _done() if s in ("finished", "stopped") else None)
+            timer.start(5000)
+            loop.exec()
+            try:
+                self._player.state_changed.disconnect()
+            except TypeError:
+                pass
+            self._player.stop()
+            self._player = None
+        if self._renderer is not None:
+            self._renderer.stop()
+            self._renderer = None
         if self._speech_engine:
             self._speech_engine.shutdown()
             self._speech_engine = None
         self._esc_target = None
+        self._update_a11y_buttons()
         self.status.showMessage("Accessibility mode off")
 
-    def _narrator(self):
-        """Lazily create a NarratorWorker, reusing it across reads so the
-        cross-session resume pointer stays consistent."""
-        if self._narrator_worker is None or not self._narrator_worker.isRunning():
-            self._narrator_worker = NarratorWorker(
-                self.engine, self.rag_index, self.ai, self.storage,
-                self._speech_queue, self)
-            self._narrator_worker.caption_ready.connect(self._on_caption_ready)
-            self._narrator_worker.chunk_progress.connect(self._on_narrator_chunk_progress)
-            self._narrator_worker.page_done.connect(self._on_narrator_page_done)
-            self._narrator_worker.failed.connect(lambda m: self.status.showMessage(f"Narrator: {m}"))
-        return self._narrator_worker
+    def _narrate(self, page, chunk=0, frame=0):
+        """Common R/C path: abort stale audio, reset the player session, and
+        render the page from (page, chunk[, frame])."""
+        renderer = self._renderer_worker()
+        renderer.flush_jobs()
+        self._player.begin(start_at=(page, chunk, frame))
+        renderer.read_page(page, start_chunk=chunk)
+        self._esc_target = "narration"
 
     def _read_current_page(self):
         """Read the current page aloud via the narrator, from the top."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
-        if not self._speech_queue:
+        if not self._player or not self._speech_engine:
             self.status.showMessage("TTS voice still loading…")
             return
-        self._esc_target = "narration"
-        # Starting fresh from the top — reset the pause button label.
-        self.a11y_play_btn.setChecked(False)
-        self.a11y_play_btn.setText("⏸ Pause")
-        self._narrator().read_page(self.current_page, start_chunk=0)
+        if not self.engine.doc:
+            return
+        self._narrate(self.current_page, 0, 0)
         self.status.showMessage(f"Reading page {self.current_page + 1}…")
 
     def _continue_reading(self):
-        """Resume narration from the last-saved position (cross-session safe)."""
+        """Resume narration from the last-saved position (cross-session safe,
+        sample-accurate within the saved chunk — E9)."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
-        if not self._speech_queue:
+        if not self._player or not self._speech_engine:
             self.status.showMessage("TTS voice still loading…")
             return
-        self._esc_target = "narration"
-        page, chunk = self._resume_pos or (self.current_page, 0)
+        page, chunk, frame = self.current_page, 0, 0
+        if self.storage:
+            pos = self.storage.get_narration_position()
+            if pos is not None:
+                page = pos.get("page", page)
+                chunk = pos.get("chunk", 0)
+                frame = pos.get("frame", 0)
+        elif self._resume_pos is not None:
+            page, chunk = self._resume_pos
         if self.engine.doc and 0 <= page < self.engine.page_count:
             self.go_to_page(page)
-            self.a11y_play_btn.setChecked(False)
-            self.a11y_play_btn.setText("⏸ Pause")
-            self._narrator().read_page(page, start_chunk=chunk)
+            self._narrate(page, chunk, frame)
             self.status.showMessage(
                 f"Continuing from page {page + 1}, chunk {chunk}…")
         else:
             # Saved position no longer valid — fall back to current page.
-            self._narrator().read_page(self.current_page, start_chunk=0)
+            self._narrate(self.current_page, 0, 0)
             self.status.showMessage(f"Reading page {self.current_page + 1}…")
 
-    def _pause_narration(self):
-        """Toggle pause/resume on the speech queue (sentence-grained)."""
-        if not self._speech_queue:
+    def _toggle_pause(self):
+        """Pause/resume narration — a frame pointer in the player (E9), so
+        resume continues mid-sentence exactly. Idle players ignore it."""
+        if not self._player or not self._speech_engine:
             return
-        if self._speech_queue.is_paused():
-            self._speech_queue.resume()
-            self.a11y_play_btn.setChecked(False)
-            self.a11y_play_btn.setText("⏸ Pause")
+        if self._player.is_paused():
+            self._player.resume()
             self.status.showMessage("Narration resumed")
-        else:
-            self._speech_queue.pause()
-            self.a11y_play_btn.setChecked(True)
-            self.a11y_play_btn.setText("▶ Resume")
+        elif self._player.is_active():
+            self._player.pause()
+            # Persist the exact frame so Continue/C resumes mid-sentence.
+            page, chunk, frame = self._player.current_position()
+            if page is not None:
+                self._resume_pos = (page, chunk)
+                if self.storage:
+                    self.storage.save_narration_position(page, chunk, frame)
             self.status.showMessage("Narration paused")
-
-    def _on_a11y_play_toggled(self, checked):
-        """Mirror the toolbar Pause/Resume button into the queue."""
-        if not self._speech_queue:
-            return
-        if checked:
-            self._speech_queue.pause()
-            self.a11y_play_btn.setText("▶ Resume")
-            self.status.showMessage("Narration paused")
-        else:
-            self._speech_queue.resume()
-            self.a11y_play_btn.setText("⏸ Pause")
-            self.status.showMessage("Narration resumed")
 
     def _on_a11y_speed(self, value, quiet=False):
-        """Speed slider: value is 50–200 → 0.5×–2.0×."""
+        """Speed slider: value is 50–200 → 0.5×–2.0×. Baked into synthesis,
+        so it applies to chunks not yet rendered (E9)."""
         self._a11y_speed = value / 100.0
         self.a11y_speed_lbl.setText(f"Speed: {self._a11y_speed:.1f}×")
-        if self._speech_queue:
-            self._speech_queue.set_rate(self._a11y_speed)
+        if self._speech_engine:
+            self._speech_engine.set_rate(self._a11y_speed)
         if not quiet:
             self.status.showMessage(f"Narration speed: {self._a11y_speed:.1f}×")
 
     def _on_a11y_volume(self, value, quiet=False):
-        """Volume slider: value is 0–100 → 0.0–1.0."""
+        """Volume slider: value is 0–100 → 0.0–1.0. Applied by the player at
+        write time — live, mid-sentence (E9)."""
         self._a11y_volume = value / 100.0
         self.a11y_vol_lbl.setText(f"Volume: {value}%")
-        if self._speech_queue:
-            self._speech_queue.set_volume(self._a11y_volume)
+        if self._player:
+            self._player.set_volume(self._a11y_volume)
+        if self._speech_engine and hasattr(self._speech_engine, "set_volume"):
+            self._speech_engine.set_volume(self._a11y_volume)
         if not quiet:
             self.status.showMessage(f"Narration volume: {value}%")
 
-    def _on_narrator_chunk_progress(self, page, chunk):
-        """Track where narration currently is (in memory, for 'Continue' within
-        a session). The disk-persisted copy is written by _on_position_played
-        only when a chunk actually starts playing, so a mid-read stop never
-        saves a resume point ahead of what the user heard (A2)."""
-        self._resume_pos = (page, chunk)
+    def _on_player_state(self, state):
+        """Player state transitions drive the toolbar buttons and status."""
+        self._update_a11y_buttons()
+        if state == "finished":
+            if self._esc_target == "narration":
+                self._esc_target = None
+            self.status.showMessage("Narration finished")
+        elif state == "underrun":
+            self.status.showMessage("Rendering more audio…")
+
+    def _update_a11y_buttons(self):
+        """Drive the accessibility toolbar from the player's state: Pause is
+        only usable while there's narration; Stop only while something is
+        active; Continue only when idle — never mid-playback."""
+        player = self._player
+        active = player is not None and player.is_active()
+        paused = player is not None and player.is_paused()
+        ready = self._a11y_mode and self._speech_engine is not None
+        self.a11y_play_btn.setEnabled(active)
+        self.a11y_play_btn.setText("▶ Resume" if paused else "⏸ Pause")
+        self.a11y_stop_btn.setEnabled(active)
+        self.a11y_continue_btn.setEnabled(ready and not active)
+        self.a11y_wav_btn.setEnabled(
+            ready and self.engine.doc is not None
+            and self.current_page < self.engine.page_count)
 
     def _on_position_played(self, page, chunk):
-        """A chunk actually began playing — safe to persist this resume point."""
+        """A chunk actually began playing — safe to persist this resume point
+        (A2: never save positions ahead of what the user really heard)."""
         self._resume_pos = (page, chunk)
         if self.storage:
-            self.storage.save_narration_position(page, chunk)
-
-    def _on_narrator_page_done(self, page):
-        """The narrator finished enqueueing this page. Resume advancement
-        happens in _on_page_played_to_end once playback actually completes."""
-        pass
+            frame = 0
+            if self._player is not None:
+                _, _, frame = self._player.current_position()
+            self.storage.save_narration_position(page, chunk, frame)
 
     def _on_page_played_to_end(self, page):
-        """The page's narration finished playing (SpeechQueue reached the end
-        marker) — advance the resume pointer to the top of the next page so
-        'Continue' doesn't replay this one."""
+        """The page's narration finished playing — advance the resume pointer
+        to the top of the next page so 'Continue' doesn't replay this one."""
         if self._esc_target == "narration":
             self._esc_target = None
         if self.storage and self.engine.doc:
             nxt = min(page + 1, self.engine.page_count - 1)
             self._resume_pos = (nxt, 0)
-            self.storage.save_narration_position(nxt, 0)
+            self.storage.save_narration_position(nxt, 0, 0)
 
     def _stop_narration(self):
-        """Stop all narration and clear the TTS queue."""
+        """Stop all narration and clear the audio timeline."""
         if self._esc_target == "narration":
             self._esc_target = None
-        if self._narrator_worker:
-            # Cancel the narrator thread too, not just the queue — otherwise a
-            # stop during a slow image-description call would resume enqueueing.
-            self._narrator_worker.cancel()
-            self._narrator_worker = None
-        if self._speech_queue:
-            self._speech_queue.cancel()
-        self.a11y_play_btn.setChecked(False)
-        self.a11y_play_btn.setText("⏸ Pause")
+        if self._renderer is not None:
+            self._renderer.flush_jobs()
+        if self._player is not None:
+            self._player.stop()
         self.status.showMessage("Narration stopped")
+        self._update_a11y_buttons()
 
     def _describe_next_image(self):
         """Describe the next image on the current page."""
@@ -1296,8 +1395,7 @@ class MainWindow(QMainWindow):
         if cached:
             desc = cached["description"]
             self._on_caption_ready(desc, f"\n\n#### 📷 Page {page_idx+1} Figure\n\n{desc}\n")
-            if self._speech_queue:
-                self._speech_queue.enqueue(f"Image on page {page_idx + 1}. {desc}")
+            self._speak(f"Image on page {page_idx + 1}. {desc}")
             self.status.showMessage(f"Image (cached): {desc[:60]}")
             return
         # Extract image and describe via vision model.
@@ -1328,8 +1426,7 @@ class MainWindow(QMainWindow):
             self.storage.save_image_description(page_idx, bbox, desc, img_path)
             rel = img_path.relative_to(self.storage.folder).as_posix()
             self._on_caption_ready(desc, f"\n\n#### 📷 Page {page_idx+1} Figure\n\n{desc}\n\n![caption]({rel})\n")
-            if self._speech_queue:
-                self._speech_queue.enqueue(f"Image on page {page_idx + 1}. {desc}")
+            self._speak(f"Image on page {page_idx + 1}. {desc}")
             self.status.showMessage(f"Image: {desc[:60]}")
         self._img_worker.done.connect(on_desc)
         self._img_worker.start()
@@ -1342,18 +1439,25 @@ class MainWindow(QMainWindow):
         """Read the notes panel text via TTS."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
-        if not self._speech_queue:
+        if not self._player or not self._renderer:
             self.status.showMessage("TTS voice still loading…")
             return
-        self._esc_target = "narration"
         text = self.notes_panel.get_plain_text()
-        if text.strip():
-            self._speech_queue.enqueue(text)
-            self.status.showMessage("Reading notes…")
+        if not text.strip():
+            self._speak("The notes are empty.")
+            return
+        renderer = self._renderer_worker()
+        renderer.flush_jobs()
+        self._player.begin()
+        renderer.read_text(text)
+        self._esc_target = "narration"
+        self.status.showMessage("Reading notes…")
 
     def _export_page_wav(self):
         """Export the current page's narration as a standalone WAV file (A10).
-        Piper-only — pyttsx3 has no offline render path."""
+        Prefers the already-rendered timeline — image captions included, so
+        the export is exactly what was narrated (E9); falls back to rendering
+        the raw page text if the page was never narrated."""
         if not self._a11y_mode:
             self.toggle_a11y(True)
         if not self._speech_engine:
@@ -1362,11 +1466,6 @@ class MainWindow(QMainWindow):
             return
         if not self.engine.doc or self.current_page >= self.engine.page_count:
             return
-        text = self.engine.extract_page_text(self.current_page)
-        if not text.strip():
-            self.status.showMessage("No text on this page to export")
-            self._speak("No text on this page to export.")
-            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Page Narration as WAV",
             f"page_{self.current_page + 1}.wav", "WAV Audio (*.wav)")
@@ -1374,7 +1473,18 @@ class MainWindow(QMainWindow):
             return
         if not path.lower().endswith(".wav"):
             path += ".wav"
-        self._speak(f"Rendering page {self.current_page + 1} to audio.")
+        if (self._player is not None
+                and self._player.active_page() == self.current_page
+                and self._player.save_wav(path)):
+            self.status.showMessage(f"Audio saved: {path}")
+            self._speak("Audio saved.")
+            return
+        text = self.engine.extract_page_text(self.current_page)
+        if not text.strip():
+            self.status.showMessage("No text on this page to export")
+            self._speak("No text on this page to export.")
+            return
+        self.status.showMessage(f"Rendering page {self.current_page + 1} to audio…")
         worker = WavExportWorker(self._speech_engine, text, path, self)
         worker.done.connect(
             lambda p: (self.status.showMessage(f"Audio saved: {p}"),
@@ -1421,10 +1531,11 @@ class MainWindow(QMainWindow):
         else:
             dlg.raise_()
             dlg.activateWindow()
-        # Read it aloud too.
-        if self._speech_queue:
-            self._speech_queue.cancel()
-            self._speech_queue.enqueue(_keybinds_text())
+        # Read it aloud too (interrupting any current narration).
+        if self._renderer is not None and self._player is not None:
+            self._renderer.flush_jobs()
+            self._player.begin()
+            self._renderer.read_text(_keybinds_text())
         self.status.showMessage("Accessibility help")
 
     def _scroll_document(self, event):
@@ -1457,15 +1568,13 @@ class MainWindow(QMainWindow):
                 # no longer requires two presses when narration is also running.
                 self._cancel_ai()
             elif (self._esc_target == "narration" and self._a11y_mode
-                    and self._speech_engine
-                    and (self._speech_engine.is_speaking()
-                         or (self._speech_queue and self._speech_queue.pending > 0))):
+                    and self._player and self._player.is_active()):
                 self._stop_narration()
             elif self.ai_infer and self.ai_infer.isRunning():
                 self._cancel_ai()
             elif self.ai_loader and self.ai_loader.isRunning():
                 self._cancel_ai()
-            elif self._a11y_mode and self._speech_engine and self._speech_engine.is_speaking():
+            elif self._a11y_mode and self._player and self._player.is_active():
                 self._stop_narration()
             else:
                 self.clear_search()
@@ -1481,7 +1590,7 @@ class MainWindow(QMainWindow):
         if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._a11y_mode:
             k = event.key()
             if k in (Qt.Key.Key_Space, Qt.Key.Key_P):
-                self._pause_narration()
+                self._toggle_pause()
                 return
             elif k == Qt.Key.Key_R:
                 self._read_current_page()
@@ -1538,13 +1647,17 @@ class MainWindow(QMainWindow):
         if self._voice_loader is not None and self._voice_loader.isRunning():
             self._a11y_mode = False  # so _on_voice_ready discards the engine
             self._voice_loader.wait(3000)
-        if self._narrator_worker:
-            self._narrator_worker.cancel()
-            self._narrator_worker.wait(3000)
-        if self._speech_queue:
-            self._speech_queue.stop()
+        if self._renderer is not None:
+            self._renderer.stop()
+        if self._player is not None:
+            self._player.stop()
         if self._speech_engine:
             self._speech_engine.shutdown()
+        if getattr(self, "_img_worker", None) and self._img_worker.isRunning():
+            # A live vision call pins the model — unload() waits on the
+            # inference lock, so a runaway call can't become a use-after-free.
+            self.ai.request_cancel()
+            self._img_worker.wait(3000)
         # Stop AI workers and free the model.
         for w in (self.ai_loader, self.ai_infer, self.index_worker):
             if w and w.isRunning():

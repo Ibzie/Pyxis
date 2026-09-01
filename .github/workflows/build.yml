@@ -27,7 +27,15 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Resolve tag version
+        id: tag
+        # v1.2.3 → 1.2.3; release artifacts are named after the pushed tag,
+        # not a hardcoded version.
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build AppImage
+        env:
+          PYXIS_VERSION: ${{ steps.tag.outputs.version }}
         run: ./packaging/build_linux.sh
 
       - name: Upload artifact
@@ -51,7 +59,14 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Resolve tag version
+        id: tag
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build EXE
+        env:
+          PYXIS_VERSION: ${{ steps.tag.outputs.version }}
         run: packaging\build_windows.bat
         shell: cmd
 
@@ -59,7 +74,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: dist/Pyxis.exe
+          path: dist/Pyxis-*-x64.exe
           if-no-files-found: error
 
   release:
@@ -89,4 +104,4 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.AppImage
-            dist/Pyxis.exe
+            dist/Pyxis-*-x64.exe

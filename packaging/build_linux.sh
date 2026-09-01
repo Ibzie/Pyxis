@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # ── Build Pyxis AppImage for Linux ────────────────────────────────────────
-# Produces: dist/Pyxis-x86_64.AppImage
+# Produces: dist/Pyxis-<version>-x86_64.AppImage
+# The version comes from $PYXIS_VERSION (CI passes the pushed git tag) or,
+# locally, from the version declared in pyproject.toml.
 #
 # Prerequisites:
 #   - Python 3.10+ venv at .venv/ with requirements.txt + pyinstaller installed
@@ -81,7 +83,18 @@ fi
 
 # ── Step 4: Build AppImage ────────────────────────────────────────────────
 echo "--- Building AppImage..."
-VERSION="${PYXIS_VERSION:-1.0.0}"
+# File-name version: PYXIS_VERSION override (CI passes the git tag), else the
+# version declared in pyproject.toml — never a stale hardcoded number.
+if [ -z "${PYXIS_VERSION:-}" ]; then
+    PYXIS_VERSION=$("$PY" - <<'PYEOF' 2>/dev/null || true
+import re
+m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', open("pyproject.toml").read())
+print(m.group(1) if m else "")
+PYEOF
+)
+    PYXIS_VERSION="${PYXIS_VERSION:-0.0.0-dev}"
+fi
+VERSION="$PYXIS_VERSION"
 ARCH=$(uname -m | sed 's/x86_64/x86_64/' | sed 's/aarch64/aarch64/')
 OUTPUT="dist/Pyxis-${VERSION}-${ARCH}.AppImage"
 

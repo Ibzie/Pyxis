@@ -289,6 +289,14 @@ class PdfStorage:
         if pixmap is not None and not pixmap.isNull():
             pixmap.save(str(self.whiteboard_file))
 
+    def delete_whiteboard(self):
+        """Remove the persisted whiteboard — a Clear must stick, or the
+        erased drawing resurrects on the next open (M5)."""
+        try:
+            self.whiteboard_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def load_whiteboard(self):
         """Return the saved whiteboard QPixmap, or None."""
         if self.whiteboard_file.exists():
@@ -341,13 +349,15 @@ class PdfStorage:
         """
         return self.annotations.get("narration_position")
 
-    def save_narration_position(self, page, chunk):
+    def save_narration_position(self, page, chunk, frame=0):
         """Persist the current narration position so the user can resume
         after closing/reopening the PDF. `chunk` is an index into the
-        page's RAG chunk list (0 = start of page)."""
+        page's RAG chunk list (0 = start of page); `frame` is the offset in
+        audio frames within that chunk (E9 sample-accurate resume)."""
         self.annotations["narration_position"] = {
             "page": int(page),
             "chunk": int(chunk),
+            "frame": int(frame),
             "timestamp": self._now_iso(),
         }
         self._save_json(self.annotations_file, self.annotations)

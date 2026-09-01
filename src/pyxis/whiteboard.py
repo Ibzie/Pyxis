@@ -27,6 +27,21 @@ class _Canvas(QWidget):
             self._buffer = QPixmap(w, h)
             self._buffer.fill(QColor("#1e1e1e"))
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # M6: the buffer is allocated at first stroke; a window resize after
+        # that left a dead zone where new strokes were silently dropped.
+        # Grow (never shrink) the buffer, preserving what's already drawn.
+        if self._buffer is not None and (
+                self._buffer.width() < self.width()
+                or self._buffer.height() < self.height()):
+            new = QPixmap(max(1, self.width()), max(1, self.height()))
+            new.fill(QColor("#1e1e1e"))
+            p = QPainter(new)
+            p.drawPixmap(0, 0, self._buffer)
+            p.end()
+            self._buffer = new
+
     def paintEvent(self, event):
         p = QPainter(self)
         if self._buffer is not None:
@@ -63,6 +78,7 @@ class _Canvas(QWidget):
         p.setPen(pen)
         p.drawLine(self.wb._last, pos)
         p.end()
+        self.wb._has_strokes = True
         self.update()
         self.wb._mark_dirty()
 
@@ -80,6 +96,7 @@ class WhiteboardWidget(QWidget):
         self._last = None
         self._dirty = False
         self._path = None
+        self._has_strokes = False   # M5: "content" is strokes, not buffer state
         self._color_btns = []
         self._build()
         self.setMinimumSize(280, 280)
@@ -136,26 +153,32 @@ class WhiteboardWidget(QWidget):
         self.changed.emit()
 
     def clear(self):
-        if self.canvas._buffer is not None:
-            self.canvas._buffer = None
-            self.canvas.update()
-            self._mark_dirty()
+        # M5: replace the buffer with a blank one (not None) and clear the
+        # strokes flag — the debounced save then deletes the stale PNG so
+        # the erased drawing can't resurrect on reopen.
+        self.canvas._ensure_buffer()
+        self.canvas._buffer.fill(QColor("#1e1e1e"))
+        self._has_strokes = False
+        self.canvas.update()
+        self._mark_dirty()
 
     # ── persistence (D1) ─────────────────────────────────────────────────────
     def load_from_path(self, path):
         self._path = path
         self.canvas._buffer = None
+        self._has_strokes = False
         if path:
             p = Path(path)
             if p.exists():
                 pix = QPixmap(str(p))
                 if not pix.isNull():
                     self.canvas._buffer = pix
+                    self._has_strokes = True
         self.canvas.update()
         self._dirty = False
 
     def has_content(self):
-        return self.canvas._buffer is not None and not self.canvas._buffer.isNull()
+        return self._has_strokes
 
     def get_pixmap(self):
         return self.canvas._buffer
