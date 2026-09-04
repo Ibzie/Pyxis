@@ -12,6 +12,8 @@ Build:
 
 import sys
 import os
+import glob
+import ctypes.util
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
@@ -27,6 +29,33 @@ piper_bins, piper_datas, piper_hidden = collect_all("piper")
 onnx_bins, onnx_datas, onnx_hidden = collect_all("onnxruntime")
 rf_bins, rf_datas, rf_hidden = collect_all("rapidfuzz")
 sd_hidden = collect_submodules("sounddevice")
+
+
+# ── PortAudio: sounddevice dlopens it by soname at runtime and the PyPI ────
+# Linux wheel does NOT bundle it — a frozen build would silently depend on
+# the target machine having libportaudio installed (it doesn't, on a clean
+# Arch/CachyOS install → no audio at all). Resolve the host's copy and ship
+# it; PyInstaller follows its dependency chain (libasound, libm, …).
+def _find_portaudio():
+    for pat in ("/usr/lib/x86_64-linux-gnu/libportaudio.so.2",
+                "/usr/lib64/libportaudio.so.2", "/usr/lib/libportaudio.so.2",
+                "/usr/lib/*/libportaudio.so.2"):
+        hits = sorted(glob.glob(pat))
+        if hits:
+            return hits[0]
+    name = ctypes.util.find_library("portaudio")
+    return name if name and os.path.isabs(name) else None
+
+
+portaudio_bins = []
+_pa = _find_portaudio()
+if _pa:
+    portaudio_bins = [(_pa, ".")]
+    print(f"  Bundling PortAudio: {_pa}")
+else:
+    print("  WARNING: libportaudio.so.2 not found on the build host — the "
+          "frozen build will only have audio where the target system "
+          "provides PortAudio")
 
 # ── Filter out unused Qt6 modules (saves ~400 MB) ─────────────────────────
 _QT_BIN_SKIP = (
@@ -60,7 +89,7 @@ def _skip_data(name):
     return any(s in norm for s in _QT_DATA_SKIP_DIRS)
 
 all_bins = (pyqt6_bins + fitz_bins + llama_bins + piper_bins
-            + onnx_bins + rf_bins)
+            + onnx_bins + rf_bins + portaudio_bins)
 all_datas = (pyqt6_datas + fitz_datas + llama_datas + piper_datas
              + onnx_datas + rf_datas)
 

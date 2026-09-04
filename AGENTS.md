@@ -7,6 +7,7 @@ Single-binary Python app: a native GUI PDF reader with integrated Markdown notes
 - Install (editable, registers the `pyxis` console script): `pip install -e ".[dev]"`
 - GPU build (NVIDIA): `CMAKE_ARGS="-DGGML_CUDA=on" pip install --upgrade --force-reinstall llama-cpp-python`
 - Run: `pyxis` (welcome screen) or `pyxis <file.pdf>` (auto-opens a file). Equivalent: `python -m pyxis`.
+- Audio smoke test: `PYXIS_SELFTEST=1 pyxis <file.pdf>` drives the real accessibility pipeline (voice load → greeting → R → pause → resume → restart → stop) against the real audio device and exits 0/1 — used to verify packaged builds end-to-end.
 - No tests, no formatter/lint config. CI (`.github/workflows/build.yml`) only builds the Linux AppImage + Windows EXE on tag push. Match the existing zero-config style.
 
 ## Architecture

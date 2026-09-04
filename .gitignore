@@ -28,3 +28,4 @@ ai.log.*
 .eggs/
 # Internal dev docs (keep docs/ user-facing content, ignore dev-side notes)
 docs/dev/
+kimi-k3-tr.pdf

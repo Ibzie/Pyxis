@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
 # AppImage entry point — runs the PyInstaller onedir bundle.
 HERE="$(dirname "$(readlink -f "${0}")")"
+# Sounddevice dlopens PortAudio by bare soname (libportaudio.so.2); a dlopen
+# search does NOT see the executable's rpath, only LD_LIBRARY_PATH and the
+# system loader cache. Export the bundle's lib dir so the bundled PortAudio
+# + ALSA chain is used even on target systems without them installed.
+export LD_LIBRARY_PATH="${HERE}/usr/bin/Pyxis/_internal${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 exec "${HERE}/usr/bin/Pyxis/Pyxis" "$@"

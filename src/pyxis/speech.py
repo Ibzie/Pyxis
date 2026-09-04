@@ -339,6 +339,7 @@ class NarrationPlayer(QThread):
         self._playing = False
         self._paused = False
         self._stop_flag = True
+        self._stream_reset = False  # player thread swaps the stream between writes
         self._volume = 1.0
         self._start_at = None     # (page, chunk, frame) resume target
         self._state = "stopped"
@@ -347,6 +348,11 @@ class NarrationPlayer(QThread):
         self._stream_sr = 0
 
     # ── main-thread API ────────────────────────────────────────────────────
+    # NB: the GUI thread NEVER touches the audio stream. Stopping/starting/
+    # closing a PortAudio stream from another thread while a write is in
+    # flight tears down the ALSA PCM underneath it ("File descriptor in bad
+    # state", at best; SIGSEGV at worst) — so begin/pause/stop only set
+    # flags, and the player thread does all stream work between writes.
     def begin(self, start_at=None):
         """Start a new narration session: reset the timeline; playback will
         start as soon as the renderer appends the first chunk."""
@@ -361,7 +367,7 @@ class NarrationPlayer(QThread):
             self._stop_flag = False
             self._start_at = start_at
             self._last_pos_key = None
-            self._close_stream_locked()
+            self._stream_reset = True   # thread closes the old stream safely
         self._set_state("rendering")
         if not self.isRunning():
             self.start()
@@ -397,13 +403,11 @@ class NarrationPlayer(QThread):
         with self._lock:
             if self._playing:
                 self._paused = True
-                self._pause_stream_locked()
         self._set_state("paused")
 
     def resume(self):
         with self._lock:
             self._paused = False
-            self._resume_stream_locked()
         self._set_state("playing")
 
     def stop(self):
@@ -417,7 +421,7 @@ class NarrationPlayer(QThread):
             self._total = 0
             self._frame_pos = 0
             self._render_done = True
-            self._close_stream_locked()
+            self._stream_reset = True
         self._set_state("stopped")
         self.wait(3000)
 
@@ -530,23 +534,11 @@ class NarrationPlayer(QThread):
             self._stream = None
             self._stream_sr = 0
 
-    def _pause_stream_locked(self):
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-            except Exception:
-                pass
-
-    def _resume_stream_locked(self):
-        if self._stream is not None:
-            try:
-                self._stream.start()
-            except Exception:
-                self._stream = None
-                self._stream_sr = 0
-
     def _ensure_stream(self, sd, sr):
+        """Create (or reconfigure) the OutputStream — player thread only."""
         if self._stream is not None and self._stream_sr == sr:
+            if not self._stream.active:
+                self._stream.start()   # resumed after a pause
             return
         self._close_stream_locked()
         self._stream = sd.OutputStream(
@@ -560,56 +552,78 @@ class NarrationPlayer(QThread):
             import numpy as np
             import sounddevice as sd
             while True:
+                data = None
+                entry = None
+                done_now = False
+                last_page = None
+                playing = paused = False
                 with self._lock:
                     if self._stop_flag:
                         break
+                    if self._stream_reset:
+                        # Session swap requested (begin/stop): safe point —
+                        # this thread is between writes.
+                        self._close_stream_locked()
+                        self._stream_reset = False
                     playing = self._playing
                     paused = self._paused
-                if not playing:
-                    time.sleep(0.05)
-                    continue
-                if paused:
-                    time.sleep(0.05)
-                    continue
-                with self._lock:
-                    avail = self._total - self._frame_pos
-                    data = None
-                    entry = None
-                    done_now = False
-                    last_page = None
-                    if avail <= 0:
-                        if self._render_done:
-                            self._playing = False
-                            done_now = True
-                            last_page = self._last_page_locked()
+                    if playing and not paused:
+                        avail = self._total - self._frame_pos
+                        if avail <= 0:
+                            if self._render_done:
+                                self._playing = False
+                                done_now = True
+                                last_page = self._last_page_locked()
+                        else:
+                            count = min(avail, self._BLOCK)
+                            data = self._slice_locked(self._frame_pos, count)
+                            entry = self._timeline[self._entry_at_locked(
+                                self._frame_pos + count - 1)]
+                            self._frame_pos += count
+                if data is not None:
+                    if self._volume != 1.0:
+                        scaled = data.astype(np.float32) * self._volume
+                        data = np.clip(scaled, -32767, 32767).astype(np.int16)
+                    try:
+                        self._ensure_stream(sd, entry["sr"])
+                        self._set_state("playing")
+                        self._stream.write(data)
+                    except Exception as e:
+                        # A dead stream must never kill the thread: rewind the
+                        # block so it replays on a fresh stream.
+                        log.warning("audio write failed, rebuilding stream: %s", e)
+                        with self._lock:
+                            self._frame_pos = max(0, self._frame_pos - len(data))
                             self._close_stream_locked()
-                    else:
-                        count = min(avail, self._BLOCK)
-                        data = self._slice_locked(self._frame_pos, count)
-                        entry = self._timeline[self._entry_at_locked(
-                            self._frame_pos + count - 1)]
-                        self._frame_pos += count
-                if data is None:
-                    if done_now:
-                        if last_page is not None:
-                            self.page_finished.emit(last_page)
-                        self._set_state("finished")
-                        break
+                        time.sleep(0.05)
+                        continue
+                    with self._lock:
+                        page, chunk, _ = self._position_locked(self._frame_pos)
+                    if page is not None and (page, chunk) != self._last_pos_key:
+                        self._last_pos_key = (page, chunk)
+                        self.position_changed.emit(page, chunk)
+                elif done_now:
+                    with self._lock:
+                        self._close_stream_locked()
+                    if last_page is not None:
+                        self.page_finished.emit(last_page)
+                    self._set_state("finished")
+                    break
+                elif not playing:
+                    time.sleep(0.05)
+                elif paused:
+                    with self._lock:
+                        if self._stream is not None and self._stream.active:
+                            try:
+                                self._stream.stop()   # between writes: safe
+                            except Exception:
+                                pass
+                    self._set_state("paused")
+                    time.sleep(0.05)
+                else:
                     # Playback caught up with the renderer (vision call…)
                     self._set_state("underrun")
                     time.sleep(0.1)
-                    continue
-                if self._volume != 1.0:
-                    scaled = data.astype(np.float32) * self._volume
-                    data = np.clip(scaled, -32767, 32767).astype(np.int16)
-                self._ensure_stream(sd, entry["sr"])
-                self._set_state("playing")
-                self._stream.write(data)
-                with self._lock:
-                    page, chunk, _ = self._position_locked(self._frame_pos)
-                if page is not None and (page, chunk) != self._last_pos_key:
-                    self._last_pos_key = (page, chunk)
-                    self.position_changed.emit(page, chunk)
         except Exception as e:
             log.exception("narration player failed")
             self.failed.emit(str(e))

@@ -30,7 +30,7 @@ class NarratorWorker(QThread):
 
     Signals:
         page_started(int)                  — page rendering began
-        chunk_ready(object, int, int, int) — (samples, page, chunk, sr)
+        chunk_ready(object, object, int, int) — (samples, page|None, chunk, sr)
         caption_ready(str, str)            — (description, image_md) for notes
         render_status(str)                 — human-readable progress
         page_done(int)                     — all chunks of a page rendered
@@ -40,7 +40,10 @@ class NarratorWorker(QThread):
     """
 
     page_started = pyqtSignal(int)
-    chunk_ready = pyqtSignal(object, int, int, int)
+    # `page` must be object-typed: text jobs pass None, and PyQt marshals
+    # None through an int parameter as garbage (it then lands in the
+    # persisted narration position — E11).
+    chunk_ready = pyqtSignal(object, object, int, int)
     caption_ready = pyqtSignal(str, str)
     render_status = pyqtSignal(str)
     page_done = pyqtSignal(int)

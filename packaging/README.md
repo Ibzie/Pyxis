@@ -37,6 +37,24 @@ artifacts after the tag: `Pyxis-<tag>-x86_64.AppImage` and
 `Pyxis-<tag>-x64.exe` (e.g. tag `v1.2.3` → `Pyxis-1.2.3-…`). Local builds
 fall back to the version declared in `pyproject.toml`.
 
+### Audio in the frozen build (PortAudio)
+
+`sounddevice` dlopens PortAudio by bare soname at runtime, and the PyPI
+Linux wheel does **not** bundle it — a frozen build would silently depend
+on the target machine having `libportaudio` installed (not present on a
+clean Arch/CachyOS install → no audio at all). Two things make the
+AppImage self-sufficient:
+
+1. `packaging/pyxis.spec` resolves the build host's `libportaudio.so.2`
+   and ships it (PyInstaller follows its ALSA dependency chain).
+2. `packaging/AppRun` exports `LD_LIBRARY_PATH` pointing at the bundle's
+   `_internal/` — a dlopen-by-soname search does not see the executable's
+   rpath, so without this the bundled copy is never found.
+
+Verify any build end-to-end with:
+`PYXIS_SELFTEST=1 ./Pyxis-<version>-x86_64.AppImage <file.pdf>`
+(plays ~30 s of real narration, prints a trace, exits 0 on pass).
+
 ## GPU acceleration
 
 The packaged app ships with a **CPU-only** `llama-cpp-python` build for

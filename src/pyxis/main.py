@@ -757,14 +757,13 @@ class MainWindow(QMainWindow):
         sx, sy = int(x * page.zoom), int(y * page.zoom)
         sw, sh = int((x1 - x) * page.zoom), int((y1 - y) * page.zoom)
         cropped = img.copy(sx, sy, sw, sh)
-        filepath, entry = self.storage.save_highlight(page.page_idx, cropped, bbox, text)
+        self.storage.save_highlight(page.page_idx, cropped, bbox, text)
         page.highlights.append(bbox)
         page.update()
-        rel = filepath.relative_to(self.storage.folder).as_posix()
+        # Notes get the quoted text only (E10); the cropped PNG stays a
+        # storage record for the on-page overlay / removal, never embedded.
         self.notes_panel.append_markdown(
-            f"### Highlight — Page {page.page_idx + 1}\n\n"
             f"> {text}\n\n"
-            f"![highlight]({rel})\n\n"
             f"_Page {page.page_idx + 1}_"
         )
         self.status.showMessage("Highlight added to notes")
@@ -1724,6 +1723,120 @@ def _apply_app_palette(app, high_contrast=False):
     app.setPalette(p)
 
 
+def _run_a11y_selftest(window, app):
+    """PYXIS_SELFTEST=1 driver: exercises the real accessibility pipeline
+    (voice load → greeting → R → pause → resume → restart → S) against the
+    real TTS voice and audio device, then exits with a pass/fail code.
+    Used to verify packaged builds (AppImage / EXE) end-to-end without a
+    human at the keyboard; requires a PDF path on the command line."""
+    import time
+    t0 = time.monotonic()
+    obs = {}
+    phase = {"n": 0, "until": 0.0}
+
+    def log(msg):
+        print(f"[selftest {time.monotonic() - t0:5.1f}s] {msg}", flush=True)
+
+    timer = QTimer(window)
+    timer.setInterval(200)
+
+    def finish(ok):
+        timer.stop()
+        log(f"observed={obs}")
+        log("PYXIS SELFTEST: " + ("PASS" if ok else "FAIL"))
+        window.close()
+        app.exit(0 if ok else 1)
+
+    def tick():
+        p = window._player
+        now = time.monotonic()
+        n = phase["n"]
+        if n == 0:
+            log("toggling accessibility on (real voice load)")
+            window.toggle_a11y(True)
+            phase["n"] = 1
+        elif n == 1:
+            if p is not None and p.is_active():
+                obs["voice"] = True
+                log("voice ready — greeting playing")
+                phase["n"], phase["until"] = 2, now + 6
+            elif now - t0 > 180:
+                log(f"voice load failed/timed out (status: "
+                    f"{window.status.currentMessage()})")
+                finish(False)
+        elif n == 2:
+            if now >= phase["until"]:
+                log(f"greeting frames={p._frame_pos}/{p._total} state={p.state()}")
+                obs["greeting_played"] = p._frame_pos > 0
+                # E11 regression: ad-hoc text must NOT create a page bookmark.
+                obs["greeting_no_page_bookmark"] = p.current_position()[0] is None
+                log("R — read current page")
+                window._read_current_page()
+                phase["n"], phase["until"] = 3, now + 8
+        elif n == 3:
+            if p.state() == "playing":
+                obs["r_playing"] = True
+            if now >= phase["until"]:
+                page, chunk, frame = p.current_position()
+                log(f"reading frames={p._frame_pos}/{p._total} book=({page},{chunk},{frame})")
+                obs["r_played"] = p._frame_pos > 20000
+                obs["r_bookmark_page"] = page == window.current_page
+                obs["r_bookmark_frame"] = frame > 0
+                log("Space — pause")
+                window._toggle_pause()
+                phase["n"], phase["until"] = 4, now + 3
+        elif n == 4:
+            if p.is_paused():
+                obs["paused"] = True
+                obs.setdefault("frozen_at", p._frame_pos)
+            if now >= phase["until"]:
+                obs["pause_frozen"] = (obs.get("frozen_at") is not None
+                                       and p._frame_pos == obs["frozen_at"])
+                log(f"paused: frozen_at={obs.get('frozen_at')} now={p._frame_pos}")
+                log("Space — resume")
+                window._toggle_pause()
+                phase["n"], phase["until"] = 5, now + 5
+        elif n == 5:
+            if p.state() == "playing" and not p.is_paused():
+                obs["resumed"] = True
+            if now >= phase["until"]:
+                log(f"resumed frames={p._frame_pos} state={p.state()}")
+                log("R — restart mid-playback")
+                window._read_current_page()
+                phase["n"], phase["until"] = 6, now + 5
+        elif n == 6:
+            if (p.state() in ("playing", "rendering", "underrun")
+                    and not p.is_paused()):
+                obs["restart_clean"] = True
+            if now >= phase["until"]:
+                log(f"restarted state={p.state()} frames={p._frame_pos}/{p._total}")
+                log("S — stop")
+                window._stop_narration()
+                phase["n"], phase["until"] = 7, now + 2
+        elif n == 7:
+            if now >= phase["until"]:
+                obs["stopped"] = not p.is_active()
+                obs["continue_enabled"] = window.a11y_continue_btn.isEnabled()
+                obs["pause_disabled"] = not window.a11y_play_btn.isEnabled()
+                pos = (window.storage.get_narration_position()
+                       if window.storage else None)
+                obs["position_sane"] = bool(
+                    pos is not None
+                    and 0 <= pos.get("page", -1) < window.engine.page_count
+                    and pos.get("frame", -1) >= 0)
+                log(f"persisted position: {pos}")
+                ok = all(obs.get(k) for k in (
+                    "voice", "greeting_played", "greeting_no_page_bookmark",
+                    "r_playing", "r_played", "r_bookmark_page", "r_bookmark_frame",
+                    "paused", "pause_frozen", "resumed", "restart_clean",
+                    "stopped", "continue_enabled", "pause_disabled",
+                    "position_sane"))
+                finish(ok)
+
+    timer.timeout.connect(tick)
+    timer.start()
+
+
 def main():
     # Lean AI logging to ai.log (rotates at 1 MB, keeps 1 backup).
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -1757,6 +1870,8 @@ def main():
     path = sys.argv[1] if len(sys.argv) > 1 else None
     window = MainWindow(path)
     window.show()
+    if os.environ.get("PYXIS_SELFTEST") == "1" and path:
+        _run_a11y_selftest(window, app)
     sys.exit(app.exec())
 
 
